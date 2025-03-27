@@ -1,0 +1,115 @@
+{
+    "width": "960",
+    "height": "540",
+    "fov": "54.4322231146",
+    "from": "26.56 8.56 0",
+    "to": "8.91 0.56 -1.2",
+    "up": "-0.35 0.91 0",
+    "envmap": "Sky.hdr",
+    "instances": [{
+    "filename": "__group1__FillCube1.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__group2__pasted__group1__pasted__FillCube1.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__group1__pasted__pCube1.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__group2__pasted__group1__pasted__pasted__pCube1.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__glas.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "glass",
+    "reflectance": "1_1_1.png"
+}, {
+    "filename": "__sibenik__object.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object1.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object2.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "diffuse",
+    "reflectance": "0.109800003469 0.0430999994278 0.0351999998093_1.0.png"
+}, {
+    "filename": "__sibenik__object3.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "conductor",
+    "roughness": "0.003803723578239983",
+    "extEta": "1.0",
+    "reflectance": "MRAMOR6X6.tga",
+    "eta": "1.65746 0.880369 0.521229",
+    "k": "9.22387 6.26952 4.837"
+}, {
+    "filename": "__sibenik__object5.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object6.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object7.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object8.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "glass",
+    "reflectance": "1_1_1.png"
+}, {
+    "filename": "__sibenik__object10.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "glass",
+    "reflectance": "1_1_1.png"
+}, {
+    "filename": "__sibenik__object11.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "glass",
+    "reflectance": "1_1_1.png"
+}, {
+    "filename": "__sibenik__object12.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object13.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "orennayar",
+    "reflectance": "KAMEN320x240-bump.tga",
+    "alpha": "0.20000000298"
+}, {
+    "filename": "__sibenik__object14.gem",
+    "world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "bsdf": "glass",
+    "reflectance": "1_1_1.png"
+}]
+}

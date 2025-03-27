@@ -1,0 +1,30 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\MSBuild\\Current\\Bin\\MSBuild.exe",
+            "args": [
+                // 指定你的解决方案文件路径
+                "C:\\Users\\u5615827\\Downloads\\RTBase-main\\RTBase.sln",
+                // 因为是图形项目，我们使用Release配置来获得更好的性能
+                "/p:Configuration=Release",
+                // 指定平台为x64
+                "/p:Platform=x64",
+                // 生成完整文件路径，有助于调试
+                "/property:GenerateFullPaths=true",
+                "/t:build",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "silent"
+            },
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}
