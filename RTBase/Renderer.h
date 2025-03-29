@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <random>
 #include <chrono>
+#include <iomanip>
 
 // Tile結構體，用於多線程渲染
 struct Tile {
@@ -446,8 +447,154 @@ public:
 		workQueue.addTiles(tiles);
 	}
 	
-	// 線程工作函數，處理工作隊列中的tile
-	void threadWork(int threadId) {
+	// 使用多線程渲染整個畫面 - 重寫該函數以實現漸進式多線程渲染
+	void renderMultithreaded()
+	{
+		std::cout << "[INFO] Starting multithreaded rendering..." << std::endl;
+		std::cout << "[INFO] Configuration: " << SPP << " samples, " 
+				  << "Tile size: " << tileSize << "x" << tileSize << ", "
+				  << "Image: " << film->width << "x" << film->height << std::endl;
+		
+		// 清空之前的渲染結果
+		film->clear();
+		canvas->clear();
+		canvas->present();
+		
+		// 初始化tiles
+		initTiles();
+		
+		// 顯示基本場景信息
+		std::cout << "[INFO] Scene: " << scene->triangles.size() << " triangles, "
+				  << scene->lights.size() << " lights" << std::endl;
+		std::cout << "[INFO] The image will gradually improve as samples complete..." << std::endl;
+		
+		// 設置線程數量
+		unsigned int availableThreads = std::thread::hardware_concurrency();
+		unsigned int numThreads = (availableThreads > 1 ? availableThreads - 1 : 1);
+		numThreads = (numThreads < (unsigned int)numProcs) ? numThreads : (unsigned int)numProcs;
+		
+		// 記錄總渲染時間
+		auto totalStartTime = std::chrono::high_resolution_clock::now();
+		
+		// 分階段渲染，每個階段添加一個樣本
+		for (int currentSpp = 0; currentSpp < SPP; currentSpp++) {
+			// 開始當前樣本
+			auto sampleStartTime = std::chrono::high_resolution_clock::now();
+			
+			// 重置工作隊列，但不清空film
+			workQueue.reset();
+			
+			// 設置正確的活動線程數量
+			activeTiles.store(numThreads);
+			
+			// 啟動線程處理當前樣本
+			for (unsigned int i = 0; i < numThreads; i++) {
+				threads[i] = new std::thread(&RayTracer::threadWorkSinglePass, this, i, currentSpp + 1);
+			}
+			
+			// 使用主線程來處理顯示更新和進度報告
+			bool isPassRendering = true;
+			int lastProgress = -1;
+			
+			// 顯示更新循環
+			while (isPassRendering) {
+				// 檢查是否所有工作線程都已完成
+				if (activeTiles.load() == 0) {
+					isPassRendering = false;
+				}
+				
+				// 計算當前進度
+				int progress = static_cast<int>(workQueue.getProgress());
+				
+				// 進度有變化時更新進度條
+				if (progress != lastProgress) {
+					// 使用單行進度條更新
+					std::cout << "\r" << "Sample " << (currentSpp + 1) << "/" << SPP << " [";
+					
+					// 進度條寬度30
+					int barWidth = 30;
+					int pos = barWidth * progress / 100;
+					
+					for (int i = 0; i < barWidth; ++i) {
+						if (i < pos) std::cout << "=";
+						else if (i == pos) std::cout << ">";
+						else std::cout << " ";
+					}
+					
+					// 計算經過的時間
+					auto currentTime = std::chrono::high_resolution_clock::now();
+					auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - sampleStartTime).count() / 1000.0f;
+					
+					std::cout << "] " << progress << "% (" << std::fixed << std::setprecision(1) << elapsed << "s)";
+					std::cout.flush();
+					
+					lastProgress = progress;
+				}
+				
+				// 短暫休眠，減少CPU佔用
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+			
+			// 等待所有線程完成
+			for (unsigned int i = 0; i < numThreads; i++) {
+				if (threads[i] && threads[i]->joinable()) {
+					threads[i]->join();
+					delete threads[i];
+					threads[i] = nullptr;
+				}
+			}
+			
+			// 更新樣本計數
+			film->SPP = currentSpp + 1;
+			
+			// 更新顯示
+			updateFullDisplay();
+			
+			// 計算並顯示樣本完成時間
+			auto sampleEndTime = std::chrono::high_resolution_clock::now();
+			auto sampleDuration = std::chrono::duration_cast<std::chrono::milliseconds>(sampleEndTime - sampleStartTime).count() / 1000.0f;
+			std::cout << "\r" << "Sample " << (currentSpp + 1) << "/" << SPP << " [";
+			for (int i = 0; i < 30; ++i) std::cout << "=";
+			std::cout << "] 100% (" << std::fixed << std::setprecision(1) << sampleDuration << "s)" << std::endl;
+		}
+		
+		// 計算總時間
+		auto totalEndTime = std::chrono::high_resolution_clock::now();
+		auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEndTime - totalStartTime).count() / 1000.0f;
+		
+		// 最終顯示更新
+		updateFullDisplay();
+		
+		std::cout << std::endl;
+		std::cout << "[INFO] Render complete in " << std::fixed << std::setprecision(2) << totalDuration << " seconds!" << std::endl;
+		std::cout << "[INFO] Average: " << std::fixed << std::setprecision(2) << (totalDuration / SPP) << " seconds per sample" << std::endl;
+	}
+	
+	// 更新全屏顯示
+	void updateFullDisplay() {
+		try {
+			if (canvas && film) {
+				// 更新所有像素
+				for (unsigned int y = 0; y < film->height; y++) {
+					for (unsigned int x = 0; x < film->width; x++) {
+						unsigned char r, g, b;
+						film->tonemap(x, y, r, g, b);
+						canvas->draw(x, y, r, g, b);
+					}
+				}
+				
+				// 顯示更新
+				canvas->present();
+			}
+		} catch (const std::exception& e) {
+			std::cout << "[ERROR] Exception during display update: " << e.what() << std::endl;
+		} catch (...) {
+			std::cout << "[ERROR] Unknown exception during display update!" << std::endl;
+		}
+	}
+	
+	// 修改單個線程工作函數，移除大量線程日誌
+	void threadWorkSinglePass(int threadId, int currentSpp) {
 		MTRandom& sampler = samplers[threadId];
 		bool hasWork = true;
 		unsigned int tilesProcessed = 0;
@@ -457,471 +604,105 @@ public:
 			// 獲取下一個要處理的tile
 			Tile* tile = workQueue.getTile();
 			
-			// 如果沒有更多tile或者隊列標記為完成，則退出
+			// 如果沒有更多tile，則退出
 			if (!tile) {
-				hasWork = false;
-				continue;
+				// 不要立即退出，等待一會兒再嘗試獲取新的tile
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				
+				tile = workQueue.getTile();
+				if (!tile) {
+					hasWork = false;
+					continue;
+				}
 			}
 			
-			// 跳過已完成的tile
-			if (tile->completed) {
+			// 跳過樣本數已達到當前樣本數的tile
+			if (tile->samplesCompleted >= currentSpp) {
 				continue;
 			}
 			
 			tilesProcessed++;
 			
-			// 处理tile中的每个像素
-			unsigned int initialSamples = 1; // 减少到1个初始样本，加快首帧显示
+			// 處理tile中的每個像素
 			unsigned int width = tile->endX - tile->startX;
 			unsigned int height = tile->endY - tile->startY;
 			
-			// 先进行初始采样
-			if (tile->samplesCompleted < initialSamples) {
-				// 对tile中的每个像素进行采样
-				for (unsigned int y = tile->startY; y < tile->endY; y++) {
-					for (unsigned int x = tile->startX; x < tile->endX; x++) {
-						// 计算像素在tile内的索引
-						unsigned int localX = x - tile->startX;
-						unsigned int localY = y - tile->startY;
+			// 對tile中的每個像素進行採樣
+			for (unsigned int y = tile->startY; y < tile->endY; y++) {
+				for (unsigned int x = tile->startX; x < tile->endX; x++) {
+					// 計算像素在tile內的索引
+					unsigned int localX = x - tile->startX;
+					unsigned int localY = y - tile->startY;
+					
+					// 確保索引有效
+					if (localX >= width || localY >= height)
+						continue;
 						
-						// 确保索引有效
-						if (localX >= width || localY >= height)
-							continue;
-							
-						unsigned int index = localY * width + localX;
-						
-						// 检查索引有效性
-						if (index >= tile->tileBuffer.size())
-							continue;
-						
-						// 生成光线
-						float px = x + sampler.next();
-						float py = y + sampler.next();
-						Ray ray = scene->camera.generateRay(px, py);
-						
-						// 根据渲染模式选择合适的渲染方法
-						Colour pixelColour;
-						switch (renderMode) {
-							case 1: // 路径追踪
-							{
-								Colour pathThroughput(1.0f, 1.0f, 1.0f);
-								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
-							}
+					unsigned int index = localY * width + localX;
+					
+					// 檢查索引有效性
+					if (index >= tile->tileBuffer.size())
+						continue;
+					
+					// 生成光線
+					float px = x + sampler.next();
+					float py = y + sampler.next();
+					Ray ray = scene->camera.generateRay(px, py);
+					
+					// 根據渲染模式選擇合適的渲染方法
+					Colour pixelColour;
+					switch (renderMode) {
+						case 1: // 路徑追蹤
+						{
+							Colour pathThroughput(1.0f, 1.0f, 1.0f);
+							pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+						}
+						break;
+						case 2: // 直接光照
+							pixelColour = direct(ray, &sampler);
 							break;
-							case 2: // 直接光照
-								pixelColour = direct(ray, &sampler);
-								break;
-							case 3: // Albedo
-								pixelColour = albedo(ray);
-								break;
-							case 4: // 法线视图
-								pixelColour = viewNormals(ray);
-								break;
-							default: // 默认使用直接光照
-								pixelColour = direct(ray, &sampler);
-						}
-						
-						// 确保颜色值有效
-						if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
-							pixelColour = Colour(0.0f, 0.0f, 0.0f);
-						}
-						
-						// 更新tile缓冲区
-						tile->tileBuffer[index] = tile->tileBuffer[index] + pixelColour;
+						case 3: // Albedo
+							pixelColour = albedo(ray);
+							break;
+						case 4: // 法線視圖
+							pixelColour = viewNormals(ray);
+							break;
+						default: // 默認使用直接光照
+							pixelColour = direct(ray, &sampler);
+					}
+					
+					// 確保顏色值有效
+					if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
+						pixelColour = Colour(0.0f, 0.0f, 0.0f);
+					}
+					
+					// 更新tile緩衝區
+					tile->tileBuffer[index] = tile->tileBuffer[index] + pixelColour;
+					
+					// 如果啟用了自適應採樣，也更新平方緩衝區
+					if (adaptiveSampling) {
 						tile->squaredBuffer[index] = tile->squaredBuffer[index] + (pixelColour * pixelColour);
-						
-						// 更新film，但不直接更新畫面（避免線程衝突）
-						{
-							std::lock_guard<std::mutex> lock(filmMutex);
-							film->splat(px, py, pixelColour);
-						}
 					}
-				}
-				
-				// 增加已完成的樣本數量
-				tile->samplesCompleted += 1;
-				
-				// 如果未完成初始采样，将tile重新加入队列
-				if (tile->samplesCompleted < initialSamples) {
-					workQueue.addTile(tile);
-				}
-				
-				// 每處理完一個tile後適當休眠，避免佔用過多CPU
-				if (tilesProcessed % 5 == 0) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					
+					// 更新film，但不直接更新畫面（避免線程衝突）
+					{
+						std::lock_guard<std::mutex> lock(filmMutex);
+						film->splat(px, py, pixelColour);
+					}
 				}
 			}
-			else if (adaptiveSampling) {
-				// 自适应采样阶段
-				bool anyPixelRendered = false;
-				
-				// 检查每个像素是否需要额外采样
-				for (unsigned int y = tile->startY; y < tile->endY; y++) {
-					for (unsigned int x = tile->startX; x < tile->endX; x++) {
-						// 计算像素在tile内的索引
-						unsigned int localX = x - tile->startX;
-						unsigned int localY = y - tile->startY;
-						
-						// 检查索引有效性
-						if (localX >= width || localY >= height)
-							continue;
-						
-						// 计算当前像素的方差
-						float variance = tile->calculateVariance(x, y);
-						
-						// 如果方差大于阈值且未达到最大样本数，继续采样
-						if (variance > tile->varianceThreshold && tile->samplesCompleted < SPP) {
-							// 计算像素在tile内的索引
-							unsigned int index = localY * width + localX;
-							
-							// 检查索引有效性
-							if (index >= tile->tileBuffer.size())
-								continue;
-							
-							// 生成光线
-							float px = x + sampler.next();
-							float py = y + sampler.next();
-							Ray ray = scene->camera.generateRay(px, py);
-							
-							// 根据渲染模式选择合适的渲染方法
-							Colour pixelColour;
-							switch (renderMode) {
-								case 1: // 路径追踪
-								{
-									Colour pathThroughput(1.0f, 1.0f, 1.0f);
-									pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
-								}
-								break;
-								case 2: // 直接光照
-									pixelColour = direct(ray, &sampler);
-									break;
-								case 3: // Albedo
-									pixelColour = albedo(ray);
-									break;
-								case 4: // 法线视图
-									pixelColour = viewNormals(ray);
-									break;
-								default: // 默认使用直接光照
-									pixelColour = direct(ray, &sampler);
-							}
-							
-							// 确保颜色值有效
-							if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
-								pixelColour = Colour(0.0f, 0.0f, 0.0f);
-							}
-							
-							// 更新tile缓冲区
-							tile->tileBuffer[index] = tile->tileBuffer[index] + pixelColour;
-							tile->squaredBuffer[index] = tile->squaredBuffer[index] + (pixelColour * pixelColour);
-							
-							// 更新film，但不直接更新畫面（避免線程衝突）
-							{
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->splat(px, py, pixelColour);
-							}
-							
-							anyPixelRendered = true;
-						}
-					}
-				}
-				
-				// 如果有像素被渲染并且未达到最大样本数，将tile重新加入队列
-				if (anyPixelRendered && tile->samplesCompleted < SPP) {
-					tile->samplesCompleted += 1;
-					workQueue.addTile(tile);
-				} else {
-					// 标记tile为已完成
-					tile->completed = true;
-				}
-				
-				// 每處理完一個tile後適當休眠，避免佔用過多CPU
-				if (tilesProcessed % 5 == 0) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				}
-			} else {
-				// 非自适应采样，每个像素添加一个样本
-				for (unsigned int y = tile->startY; y < tile->endY; y++) {
-					for (unsigned int x = tile->startX; x < tile->endX; x++) {
-						// 计算像素在tile内的索引
-						unsigned int localX = x - tile->startX;
-						unsigned int localY = y - tile->startY;
-						
-						// 检查索引有效性
-						if (localX >= width || localY >= height)
-							continue;
-							
-						unsigned int index = localY * width + localX;
-						
-						// 检查索引有效性
-						if (index >= tile->tileBuffer.size())
-							continue;
-						
-						// 生成光线
-						float px = x + sampler.next();
-						float py = y + sampler.next();
-						Ray ray = scene->camera.generateRay(px, py);
-						
-						// 根据渲染模式选择合适的渲染方法
-						Colour pixelColour;
-						switch (renderMode) {
-							case 1: // 路径追踪
-							{
-								Colour pathThroughput(1.0f, 1.0f, 1.0f);
-								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
-							}
-							break;
-							case 2: // 直接光照
-								pixelColour = direct(ray, &sampler);
-								break;
-							case 3: // Albedo
-								pixelColour = albedo(ray);
-								break;
-							case 4: // 法线视图
-								pixelColour = viewNormals(ray);
-								break;
-							default: // 默认使用直接光照
-								pixelColour = direct(ray, &sampler);
-						}
-						
-						// 确保颜色值有效
-						if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
-							pixelColour = Colour(0.0f, 0.0f, 0.0f);
-						}
-						
-						// 更新tile缓冲区
-						tile->tileBuffer[index] = tile->tileBuffer[index] + pixelColour;
-						
-						// 更新film，但不直接更新畫面（避免線程衝突）
-						{
-							std::lock_guard<std::mutex> lock(filmMutex);
-							film->splat(px, py, pixelColour);
-						}
-					}
-				}
-				
-				tile->samplesCompleted += 1;
-				
-				// 如果未达到总样本数，将tile重新加入队列
-				if (tile->samplesCompleted < SPP) {
-					workQueue.addTile(tile);
-				} else {
-					// 标记tile为已完成
-					tile->completed = true;
-				}
-				
-				// 每處理完一個tile後適當休眠，避免佔用過多CPU
-				if (tilesProcessed % 5 == 0) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				}
+			
+			// 增加已完成的樣本數量
+			tile->samplesCompleted += 1;
+			
+			// 每處理完一個tile後適當休眠，避免佔用過多CPU
+			if (tilesProcessed % 10 == 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
-		}
-		
-		// 如果這個線程處理了一些tiles，打印信息
-		if (tilesProcessed > 0) {
-			std::cout << "Thread " << threadId << " completed processing " << tilesProcessed << " tiles" << std::endl;
 		}
 		
 		// 退出前減少活動線程計數
 		activeTiles.fetch_sub(1);
-	}
-	
-	// 使用多線程渲染整個畫面 - 重寫該函數以解決黑屏問題
-	void renderMultithreaded() {
-		// [DEBUG] Starting multithreaded render function
-		std::cout << "[DEBUG] Starting multithreaded rendering..." << std::endl;
-		
-		// 清空之前的渲染結果
-		film->clear();
-		canvas->clear();
-		canvas->present(); // 立即更新顯示，確保用戶能看到清空的畫面
-		
-		// 初始化tiles
-		std::cout << "[DEBUG] Initializing tiles..." << std::endl;
-		initTiles();
-		
-		// 添加調試輸出，檢查場景是否正確加載
-		std::cout << "[DEBUG] Checking scene status..." << std::endl;
-		std::cout << "  - Triangle count: " << scene->triangles.size() << std::endl;
-		std::cout << "  - Light count: " << scene->lights.size() << std::endl;
-		std::cout << "  - Image size: " << film->width << "x" << film->height << std::endl;
-		
-		// 重置工作隊列並設置計數器
-		workQueue.reset();
-		film->SPP = 0;
-		
-		// 使用較少的線程數量，以避免過度並行造成的問題
-		unsigned int availableThreads = std::thread::hardware_concurrency();
-		// 使用正確的std::min函數調用
-		unsigned int numThreads = (availableThreads > 1 ? availableThreads - 1 : 1);
-		numThreads = (numThreads < (unsigned int)numProcs) ? numThreads : (unsigned int)numProcs;
-		
-		std::cout << "[DEBUG] Starting render with " << numThreads << " threads..." << std::endl;
-		std::cout << "The image will gradually appear - please be patient..." << std::endl;
-		std::cout << "You should see the first results within a few seconds..." << std::endl;
-		
-		// 記錄開始時間
-		auto startTime = std::chrono::high_resolution_clock::now();
-		
-		// 設置正確的活動線程數量
-		activeTiles.store(numThreads);
-		
-		// 確保線程指針數組初始化正確
-		std::cout << "[DEBUG] Launching worker threads..." << std::endl;
-		for (unsigned int i = 0; i < numThreads; i++) {
-			threads[i] = new std::thread(&RayTracer::threadWork, this, i);
-			std::cout << "[DEBUG] Thread " << i << " created." << std::endl;
-		}
-		
-		// 使用主線程來處理顯示更新，避免線程間的Direct3D上下文衝突
-		// 這是一個關鍵變更，因為Direct3D通常不是線程安全的
-		bool isRendering = true;
-		int lastProgress = -1;
-		
-		std::cout << "[DEBUG] Entering main display loop..." << std::endl;
-		
-		while (isRendering) {
-			// 檢查是否所有工作線程都已完成
-			if (activeTiles.load() == 0) {
-				isRendering = false;
-				std::cout << "[DEBUG] All worker threads have completed." << std::endl;
-			}
-			
-			// 計算當前進度
-			int progress = static_cast<int>(workQueue.getProgress());
-			
-			// 如果進度有變化，則打印
-			if (progress != lastProgress && progress % 5 == 0) {
-				auto currentTime = std::chrono::high_resolution_clock::now();
-				auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startTime).count();
-				
-				std::cout << "Rendering progress: " << progress << "%, elapsed time: " << elapsed << " seconds" << std::endl;
-				lastProgress = progress;
-			}
-			
-			// [DEBUG] Update display
-			std::cout << "[DEBUG] Updating display..." << std::endl;
-			
-			try {
-				// 優化顯示更新 - 使用批量更新而不是逐像素更新
-				// 這會減少Direct3D的狀態變化，提高性能
-				if (canvas && film) {
-					// 將film中的數據直接複製到canvas的backBuffer
-					unsigned char* backBuffer = canvas->getBackBuffer();
-					if (backBuffer) {
-						unsigned int pixelCount = film->width * film->height;
-						
-						// 只更新顯示，每20幀更新一次全畫面，這樣可以減少計算負擔
-						static int frameCount = 0;
-						frameCount++;
-						
-						if (frameCount % 20 == 0) {
-							// 完整更新
-							for (unsigned int i = 0; i < pixelCount; i++) {
-								unsigned int x = i % film->width;
-								unsigned int y = i / film->width;
-								unsigned char r, g, b;
-								film->tonemap(x, y, r, g, b);
-								canvas->draw(x, y, r, g, b);  // 使用正確版本的draw函數
-							}
-							std::cout << "[DEBUG] Full display update." << std::endl;
-						} else {
-							// 部分更新 - 只更新幾個tile的數據
-							// 計算當前應該更新的tile
-							int tileToUpdate = frameCount % tiles.size();
-							if (tileToUpdate < tiles.size()) {
-								Tile* tile = tiles[tileToUpdate];
-								for (unsigned int y = tile->startY; y < tile->endY; y++) {
-									for (unsigned int x = tile->startX; x < tile->endX; x++) {
-										if (x < film->width && y < film->height) {
-											unsigned char r, g, b;
-											film->tonemap(x, y, r, g, b);
-											canvas->draw(x, y, r, g, b);
-										}
-									}
-								}
-								std::cout << "[DEBUG] Updated tile " << tileToUpdate << " of " << tiles.size() << std::endl;
-							}
-						}
-					} else {
-						std::cout << "[ERROR] Canvas backbuffer is null!" << std::endl;
-					}
-				} else {
-					std::cout << "[ERROR] Canvas or film is null!" << std::endl;
-				}
-				
-				// 更新顯示 - 在主線程中調用present而不是在工作線程中
-				if (canvas) {
-					canvas->present();
-					std::cout << "[DEBUG] Display updated successfully." << std::endl;
-				} else {
-					std::cout << "[ERROR] Canvas is null during present call!" << std::endl;
-				}
-			} catch (const std::exception& e) {
-				std::cout << "[ERROR] Exception during display update: " << e.what() << std::endl;
-			} catch (...) {
-				std::cout << "[ERROR] Unknown exception during display update!" << std::endl;
-			}
-			
-			// 短暫休眠，減少CPU佔用，同時讓工作線程有更多時間處理渲染
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		}
-		
-		std::cout << "[DEBUG] Joining worker threads..." << std::endl;
-		
-		// 等待所有線程完成
-		for (unsigned int i = 0; i < numThreads; i++) {
-			if (threads[i] && threads[i]->joinable()) {
-				std::cout << "[DEBUG] Joining thread " << i << "..." << std::endl;
-				threads[i]->join();
-				delete threads[i];
-				threads[i] = nullptr;
-				std::cout << "[DEBUG] Thread " << i << " joined successfully." << std::endl;
-			}
-		}
-		
-		std::cout << "[DEBUG] Setting workQueue as done..." << std::endl;
-		// 設置工作隊列完成標誌
-		workQueue.setDone();
-		
-		// 記錄結束時間並計算總時間
-		auto endTime = std::chrono::high_resolution_clock::now();
-		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-		
-		// 更新film的SPP計數
-		film->SPP = SPP;
-		
-		std::cout << "[DEBUG] Final display update..." << std::endl;
-		// 最終更新畫面 - 確保顯示最終結果
-		try {
-			if (canvas && film) {
-				unsigned char* backBuffer = canvas->getBackBuffer();
-				if (backBuffer) {
-					std::cout << "[DEBUG] Performing final full screen update..." << std::endl;
-					// 完整更新所有像素
-					for (unsigned int y = 0; y < film->height; y++) {
-						for (unsigned int x = 0; x < film->width; x++) {
-							unsigned char r, g, b;
-							film->tonemap(x, y, r, g, b);
-							canvas->draw(x, y, r, g, b);
-						}
-					}
-					
-					// 最終一次呈現
-					canvas->present();
-					std::cout << "[DEBUG] Final display update completed successfully." << std::endl;
-				} else {
-					std::cout << "[ERROR] Canvas backbuffer is null during final update!" << std::endl;
-				}
-			} else {
-				std::cout << "[ERROR] Canvas or film is null during final update!" << std::endl;
-			}
-		} catch (const std::exception& e) {
-			std::cout << "[ERROR] Exception during final display update: " << e.what() << std::endl;
-		} catch (...) {
-			std::cout << "[ERROR] Unknown exception during final display update!" << std::endl;
-		}
-		
-		std::cout << "Render complete in " << (duration / 1000.0) << " seconds!" << std::endl;
 	}
 	
 	void render()

@@ -57,10 +57,10 @@ int main(int argc, char *argv[])
 	// 渲染質量設置
 	unsigned int SPP = 32;    // 每像素採樣數
 	int renderMode = 1;       // 渲染模式: 1=路徑追蹤, 2=直接光照, 3=僅顯示顏色, 4=顯示法線
-	int maxPathDepth = 4;    // 路徑追蹤最大反射深度
+	int maxPathDepth = 6;    // 路徑追蹤最大反射深度
 	bool useMultithread = true; // 是否啟用多線程渲染
-	bool useAdaptiveSampling = false; // 是否啟用自適應採樣
-	unsigned int tileSize = 32;  // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
+	bool useAdaptiveSampling = true; // 是否啟用自適應採樣
+	int tileSize = 16;  // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
 	
 	// 性能監控變量（無需修改）
 	double totalRenderTime = 0.0;
