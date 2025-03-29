@@ -6,6 +6,7 @@
 #include "Imaging.h"
 #include "Materials.h"
 #include "Lights.h"
+#include <chrono>
 
 class Camera
 {
@@ -70,9 +71,18 @@ public:
 		triangles.clear();
 		
 		std::cout << "Building BVH for " << inputTriangles.size() << " triangles..." << std::endl;
+		
+		// Record BVH build start time
+		auto startTime = std::chrono::high_resolution_clock::now();
+		
 		bvh = new BVHNode();
 		bvh->build(inputTriangles, triangles);
-		std::cout << "BVH built with depth: " << bvh->getDepth() << " and " << bvh->getNodeCount() << " nodes" << std::endl;
+		
+		// Calculate BVH build time
+		auto endTime = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+		
+		std::cout << "BVH built in " << duration << " ms" << std::endl;
 		
 		// Do not touch the code below this line!
 		// Build light list

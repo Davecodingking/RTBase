@@ -49,16 +49,26 @@ int main(int argc, char *argv[])
 	// Add call to tests if required
 	// runTests()
 	
-	// Initialize default parameters
-	std::string sceneName = "Scenes1/bathroom";  // 改用更簡單的bathroom場景
-	std::string filename = "bathroom-render.hdr";
-	unsigned int SPP = 16; // 進一步減少樣本數
+	//=================== 參數設置（開始）===================
+	// 場景和輸出設置
+	std::string sceneName = "cornell-box";  // 場景名稱: cornell-box, house 等
+	std::string filename = "cornell-box-render.hdr"; // 輸出文件名
 	
-	// 追蹤性能
+	// 渲染質量設置
+	unsigned int SPP = 32;    // 每像素採樣數
+	int renderMode = 1;       // 渲染模式: 1=路徑追蹤, 2=直接光照, 3=僅顯示顏色, 4=顯示法線
+	int maxPathDepth = 4;    // 路徑追蹤最大反射深度
+	bool useMultithread = true; // 是否啟用多線程渲染
+	bool useAdaptiveSampling = false; // 是否啟用自適應採樣
+	unsigned int tileSize = 32;  // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
+	
+	// 性能監控變量（無需修改）
 	double totalRenderTime = 0.0;
 	int frames = 0;
-	long long totalRays = 0; // 声明totalRays变量
+	long long totalRays = 0;
+	//=================== 參數設置（結束）===================
 
+	// 處理命令行參數
 	if (argc > 1)
 	{
 		std::unordered_map<std::string, std::string> args;
@@ -95,6 +105,26 @@ int main(int argc, char *argv[])
 			{
 				SPP = stoi(pair.second);
 			}
+			if (pair.first == "-renderMode")
+			{
+				renderMode = stoi(pair.second);
+			}
+			if (pair.first == "-maxPathDepth")
+			{
+				maxPathDepth = stoi(pair.second);
+			}
+			if (pair.first == "-useMultithread")
+			{
+				useMultithread = (pair.second == "true");
+			}
+			if (pair.first == "-useAdaptiveSampling")
+			{
+				useAdaptiveSampling = (pair.second == "true");
+			}
+			if (pair.first == "-tileSize")
+			{
+				tileSize = stoi(pair.second);
+			}
 		}
 	}
 	Scene* scene = loadScene(sceneName);
@@ -127,10 +157,15 @@ int main(int argc, char *argv[])
 	canvas.create((unsigned int)scene->camera.width, (unsigned int)scene->camera.height, "Tracer", 1.0f);
 	RayTracer rt;
 	rt.init(scene, &canvas);
-	// 設置渲染模式為直接光照模式
-	rt.setRenderMode(2);
-	// 設置目標樣本數
+	
+	// 應用上面設置的參數
+	rt.setRenderMode(renderMode);
 	rt.SPP = SPP;
+	rt.maxPathDepth = maxPathDepth;
+	rt.multithreaded = useMultithread;
+	rt.adaptiveSampling = useAdaptiveSampling;
+	rt.tileSize = tileSize;
+	
 	bool running = true;
 	GamesEngineeringBase::Timer timer;
 	GamesEngineeringBase::Timer totalTimer;
@@ -145,6 +180,7 @@ int main(int argc, char *argv[])
 	printRow("Light Count", std::to_string(scene->lights.size()));
 	printRow("Target SPP", std::to_string(SPP));
 	printRow("Rendering Mode", getRenderModeName(rt.getRenderMode()));
+	printRow("Max Path Depth", std::to_string(rt.maxPathDepth));
 	printRow("Output File", filename);
 	
 	// BVH信息（如果可用）
@@ -155,6 +191,19 @@ int main(int argc, char *argv[])
 	
 	std::cout << "Starting rendering... Press ESC to stop." << std::endl;
 	
+	// 確保在渲染前畫面已清空
+	canvas.clear();
+	
+	// 打印渲染配置
+	std::cout << "Rendering configuration:" << std::endl;
+	std::cout << " - Mode: " << getRenderModeName(rt.getRenderMode()) << std::endl;
+	std::cout << " - Max Path Depth: " << rt.maxPathDepth << std::endl;
+	std::cout << " - Multithreaded: " << (rt.multithreaded ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Adaptive Sampling: " << (rt.adaptiveSampling ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Tile Size: " << rt.tileSize << "x" << rt.tileSize << std::endl;
+	std::cout << " - Target SPP: " << rt.SPP << std::endl;
+	std::cout << std::endl;
+	
 	while (running)
 	{
 		canvas.checkInput();
@@ -162,108 +211,97 @@ int main(int argc, char *argv[])
 		{
 			break;
 		}
+		
+		// 檢查是否已經完成所有樣本
+		if (rt.film->SPP >= rt.SPP) {
+			// 已經達到目標樣本數，不再繼續渲染
+			if (frames == 0) {
+				// 只在第一次達到目標時保存結果
+				std::cout << "Rendering completed with " << rt.film->SPP << " samples." << std::endl;
+				// 保存结果
+				rt.saveHDR(filename);
+				std::cout << "Image saved to " << filename << std::endl;
+				
+				std::string pngFilename = filename.substr(0, filename.find_last_of('.')) + ".png";
+				rt.savePNG(pngFilename);
+				std::cout << "PNG image saved to " << pngFilename << std::endl;
+				
+				frames = 1; // 標記為已完成渲染
+			}
+		} else {
+			// 尚未達到目標樣本數，繼續渲染
+			// 啟動渲染計時器
+			timer.reset();
+			// 繼續渲染下一個樣本
+			rt.render();
+			// 計算渲染時間
+			double renderTime = timer.dt();
+			totalRenderTime += renderTime;
+			frames++;
+			
+			std::cout << "Sample " << rt.film->SPP << "/" << rt.SPP << " completed in " << renderTime << " seconds." << std::endl;
+			
+			// 定期顯示更新的圖像
+			canvas.present();
+			
+			// 如果已達到目標樣本數，保存最終結果
+			if (rt.film->SPP >= rt.SPP) {
+				// 保存结果
+				rt.saveHDR(filename);
+				std::cout << "Image saved to " << filename << std::endl;
+				
+				std::string pngFilename = filename.substr(0, filename.find_last_of('.')) + ".png";
+				rt.savePNG(pngFilename);
+				std::cout << "PNG image saved to " << pngFilename << std::endl;
+			}
+		}
+		
+		// 使用场景相机漫游功能
 		if (canvas.keyPressed('W'))
 		{
 			viewcamera.forward();
 			rt.clear();
 			canvas.clear();
+			frames = 0; // 重置渲染状态，以便重新渲染
 		}
 		if (canvas.keyPressed('S'))
 		{
 			viewcamera.back();
 			rt.clear();
 			canvas.clear();
+			frames = 0;
 		}
 		if (canvas.keyPressed('A'))
 		{
 			viewcamera.left();
 			rt.clear();
 			canvas.clear();
+			frames = 0;
 		}
 		if (canvas.keyPressed('D'))
 		{
 			viewcamera.right();
 			rt.clear();
 			canvas.clear();
+			frames = 0;
 		}
 		if (canvas.keyPressed('E'))
 		{
 			viewcamera.flyUp();
 			rt.clear();
 			canvas.clear();
+			frames = 0;
 		}
 		if (canvas.keyPressed('Q'))
 		{
 			viewcamera.flyDown();
 			rt.clear();
 			canvas.clear();
+			frames = 0;
 		}
-		// Time how long a render call takes
-		timer.reset();
-		rt.render();
-		float frameTime = timer.dt();
-		totalRenderTime += frameTime;
-		frames++;
 		
-		// 当前SPP
-		int currentSPP = rt.getSPP();
-		
-		// 计算进度和性能指标
-		float progress = (float)currentSPP / SPP * 100.0f;
-		
-		// 计算每秒采样数
-		float pixelCount = scene->camera.width * scene->camera.height;
-		float samplesPerSecond = (pixelCount * currentSPP) / totalRenderTime;
-		
-		// 估计光线数量
-		long long rayCount = (long long)(pixelCount * currentSPP * 2); // 粗略估计，每个样本平均2条光线
-		totalRays = rayCount;
-		float raysPerSecond = rayCount / totalRenderTime;
-		
-		// 简单进度更新（不刷新整个表格）
-		std::cout << "SPP: " << currentSPP << "/" << SPP 
-			<< " [" << std::fixed << std::setprecision(1) << progress << "%] " 
-			<< "Time: " << std::fixed << std::setprecision(2) << totalRenderTime << "s " 
-			<< "Frame: " << std::fixed << std::setprecision(2) << frameTime << "s"
-			<< std::endl;
-		
-		if (canvas.keyPressed('P'))
-		{
-			rt.saveHDR(filename);
-		}
-		if (canvas.keyPressed('L'))
-		{
-			size_t pos = filename.find_last_of('.');
-			std::string ldrFilename = filename.substr(0, pos) + ".png";
-			rt.savePNG(ldrFilename);
-		}
-		if (currentSPP >= SPP)
-		{
-			rt.saveHDR(filename);
-			
-			// 渲染完成，显示最终报告
-			double totalTime = totalRenderTime;
-			printHeader("RENDERING COMPLETE");
-			
-			// 时间统计
-			printRow("Total Render Time", std::to_string(totalTime) + " seconds");
-			printRow("Average Sample Time", std::to_string(totalTime / SPP) + " seconds");
-			printRow("Average Frame Time", std::to_string(totalRenderTime / frames) + " seconds");
-			
-			// 采样统计
-			printRow("Total Rays", std::to_string(totalRays));
-			printRow("Rays per Second", std::to_string((float)totalRays / totalTime));
-			printRow("Total Samples", std::to_string(SPP * (long long)(scene->camera.width * scene->camera.height)));
-			
-			// 文件信息
-			printRow("HDR Output", filename);
-			printRow("Preview Image", filename.substr(0, filename.find_last_of('.')) + ".png");
-			
-			printSeparator();
-			
-			break;
-		}
-		canvas.present();
+		// 简单延时以减少CPU使用率
+		Sleep(16); // 约60FPS
 	}
 	return 0;
 }

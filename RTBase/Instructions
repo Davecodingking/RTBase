@@ -1,0 +1,35 @@
+1	Implementation (85 Marks)
+This section provides details of the type of algorithms which can be implemented as part of this coursework. We developed a path tracer during the in-class sessions, and it is expected that you will build on this to add further functionality. This assessment is split into two parts: one which extends the functionality of the path tracer, and the second which adds other light transport algorithms.
+
+Extending the functionality of the path tracer (35 Marks):
+
+-	Add more materials:
+o	Add a GGX Microfacet BRDF (Evaluation and sampling proportional to the NDF) 
+o	Add a Glass BRDF
+-	Exploit techniques to speed up render times
+o	Use multiple threads to perform tile based rendering
+o	Implement a tile based adaptive sampler
+o	Integrate an existing denoiser into the renderer (Intel Open Image Denoise is recommended, you will need to render AOVs for this)
+-	Add environment lighting
+o	Implement sampling and evaluating environment maps stored in latitude-longitude format
+o	Combine with MIS to reduce variance
+The second part of the coding assessment is the addition of other light transport or sampling algorithms. Each of these has a weight based on its implementation difficulty and they are grouped by common features and implementation challenge. Please choose one group to implement for this assessment. If you would like to implement an algorithm not on this list, please speak to the module tutor.
+
+The groups are as follows:
+
+-	Instant Radiosity (25 Marks)
+-	Irradiance Cache (25 Marks)                                                                        
+OR
+
+-	Instant Radiosity (25 Marks)
+-	Photon Mapping (25 Marks)
+
+OR
+
+-	Instant Radiosity (25 Marks)
+-	Light Tracing (25 Marks)
+OR
+-	Progressive Photon Mapping (50 Marks)
+OR
+-	Primary Sample Space Metropolis Light Transport (50 Marks)
+o	You can integrate with the path tracer, or any other algorithm if this is implemented

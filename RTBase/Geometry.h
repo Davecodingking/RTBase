@@ -328,13 +328,6 @@ public:
 			bounds.extend(inputTriangles[i].vertices[2].p);
 		}
 		
-		// 只在顶层节点输出包围盒信息
-		if (inputTriangles.size() > 1000) {
-			std::cout << "Scene AABB: [" 
-				<< bounds.min.x << "," << bounds.min.y << "," << bounds.min.z << "] to ["
-				<< bounds.max.x << "," << bounds.max.y << "," << bounds.max.z << "]" << std::endl;
-		}
-		
 		// 如果三角形数量小于阈值，作为叶子节点
 		if (inputTriangles.size() <= MAXNODE_TRIANGLES)
 		{
@@ -502,11 +495,6 @@ public:
 		// 使用纯粹的SAH决策，不强制分割
 		if (bestAxis == -1 || bestCost >= noSplitCost)
 		{
-			// 只有大量三角形時才輸出
-			if (inputTriangles.size() > 1000) {
-				std::cout << "SAH decision: Not splitting " << inputTriangles.size() << " triangles" << std::endl;
-			}
-			
 			// 存儲三角形在輸出數組中的索引
 			int startIndex = outputTriangles.size();
 			for (int i = 0; i < inputTriangles.size(); i++)
@@ -515,12 +503,6 @@ public:
 				triangleIndices.push_back(startIndex + i);
 			}
 			return;
-		}
-		
-		// 只輸出分裂大量三角形時的信息
-		if (inputTriangles.size() > 1000) {
-			std::cout << "SAH decision: Splitting " << inputTriangles.size() 
-				<< " triangles on axis " << bestAxis << std::endl;
 		}
 		
 		// 根据最佳分割分组
