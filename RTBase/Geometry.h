@@ -3,6 +3,21 @@
 #include "Core.h"
 #include "Sampling.h"
 
+// 將宏定義更改為變量，以支持運行時設置
+extern int USE_MAX_TRIANGLES;
+extern float USE_TRAVERSE_COST;
+extern float USE_TRIANGLE_COST;
+extern int USE_BUILD_BINS;
+extern float RAY_EPSILON;
+
+// 保留預設值作為初始化值
+#define MAXNODE_TRIANGLES 8
+#define TRAVERSE_COST 1.0f
+#define TRIANGLE_COST 2.0f
+#define BUILD_BINS 16   // BVH構建時的分割數
+
+#define EPSILON 0.001f // 浮點誤差容忍度 - 用於一般浮點比較
+
 class Ray
 {
 public:
@@ -57,7 +72,7 @@ public:
 
 };
 
-#define EPSILON 0.001f
+
 
 class Triangle
 {
@@ -288,10 +303,7 @@ struct IntersectionData
 	float gamma;
 };
 
-#define MAXNODE_TRIANGLES 8
-#define TRAVERSE_COST 1.0f
-#define TRIANGLE_COST 2.0f
-#define BUILD_BINS 16
+
 
 class BVHNode
 {
@@ -329,7 +341,7 @@ public:
 		}
 		
 		// 如果三角形数量小于阈值，作为叶子节点
-		if (inputTriangles.size() <= MAXNODE_TRIANGLES)
+		if (inputTriangles.size() <= USE_MAX_TRIANGLES)
 		{
 			// 存儲三角形在輸出數組中的索引
 			int startIndex = outputTriangles.size();
@@ -418,8 +430,8 @@ public:
 				int count = 0;
 			};
 			
-			std::vector<Bin> bins(BUILD_BINS);
-			for (int i = 0; i < BUILD_BINS; i++) {
+			std::vector<Bin> bins(USE_BUILD_BINS);
+			for (int i = 0; i < USE_BUILD_BINS; i++) {
 				bins[i].bounds.reset();
 			}
 			
@@ -432,7 +444,7 @@ public:
 				else if (axis == 1) coord = centroid.y;
 				else coord = centroid.z;
 				
-				int binIndex = std::min(BUILD_BINS - 1, static_cast<int>((coord - minCoord) / range * BUILD_BINS));
+				int binIndex = std::min(USE_BUILD_BINS - 1, static_cast<int>((coord - minCoord) / range * USE_BUILD_BINS));
 				
 				bins[binIndex].count++;
 				bins[binIndex].bounds.extend(inputTriangles[i].vertices[0].p);
@@ -441,13 +453,13 @@ public:
 			}
 			
 			// 从左到右计算累积包围盒
-			std::vector<AABB> rightBoxes(BUILD_BINS);
-			std::vector<int> rightCounts(BUILD_BINS);
+			std::vector<AABB> rightBoxes(USE_BUILD_BINS);
+			std::vector<int> rightCounts(USE_BUILD_BINS);
 			
-			rightBoxes[BUILD_BINS - 1] = bins[BUILD_BINS - 1].bounds;
-			rightCounts[BUILD_BINS - 1] = bins[BUILD_BINS - 1].count;
+			rightBoxes[USE_BUILD_BINS - 1] = bins[USE_BUILD_BINS - 1].bounds;
+			rightCounts[USE_BUILD_BINS - 1] = bins[USE_BUILD_BINS - 1].count;
 			
-			for (int i = BUILD_BINS - 2; i >= 0; i--)
+			for (int i = USE_BUILD_BINS - 2; i >= 0; i--)
 			{
 				rightBoxes[i] = rightBoxes[i + 1];
 				rightBoxes[i].extend(bins[i].bounds.min);
@@ -459,7 +471,7 @@ public:
 			AABB leftBox;
 			int leftCount = 0;
 			
-			for (int i = 0; i < BUILD_BINS - 1; i++)
+			for (int i = 0; i < USE_BUILD_BINS - 1; i++)
 			{
 				if (bins[i].count == 0) continue;
 				
@@ -474,7 +486,7 @@ public:
 				float rightArea = rightBoxes[i + 1].area();
 				float totalArea = bounds.area();
 				
-				float cost = TRAVERSE_COST + TRIANGLE_COST * (
+				float cost = USE_TRAVERSE_COST + USE_TRIANGLE_COST * (
 					(leftArea / totalArea) * leftCount + 
 					(rightArea / totalArea) * rightCounts[i + 1]
 				);
@@ -490,7 +502,7 @@ public:
 		}
 		
 		// 没有找到好的分割或者分割代价比直接处理所有三角形还高
-		float noSplitCost = TRIANGLE_COST * inputTriangles.size();
+		float noSplitCost = USE_TRIANGLE_COST * inputTriangles.size();
 		
 		// 使用纯粹的SAH决策，不强制分割
 		if (bestAxis == -1 || bestCost >= noSplitCost)
@@ -512,7 +524,7 @@ public:
 		else { minCoord = bounds.min.z; maxCoord = bounds.max.z; }
 		
 		float range = maxCoord - minCoord;
-		float splitPos = minCoord + range * (bestBin + 1) / BUILD_BINS;
+		float splitPos = minCoord + range * (bestBin + 1) / USE_BUILD_BINS;
 		
 		std::vector<Triangle> leftTriangles;
 		std::vector<Triangle> rightTriangles;
@@ -697,7 +709,7 @@ public:
 		int leftDepth = (l != NULL) ? l->getDepth() : 0;
 		int rightDepth = (r != NULL) ? r->getDepth() : 0;
 		
-		return 1 + std::max(leftDepth, rightDepth);
+		return 1 + ((leftDepth > rightDepth) ? leftDepth : rightDepth);
 	}
 	
 	// 获取BVH树的节点数量

@@ -5,6 +5,14 @@
 #include "GamesEngineeringBase.h"
 #include <unordered_map>
 #include <iomanip>
+#include <algorithm> // 添加algorithm头文件，提供std::max等函数
+
+// 定義在Geometry.h中聲明的外部變量
+int USE_MAX_TRIANGLES = MAXNODE_TRIANGLES;
+float USE_TRAVERSE_COST = TRAVERSE_COST;
+float USE_TRIANGLE_COST = TRIANGLE_COST;
+int USE_BUILD_BINS = BUILD_BINS;
+float RAY_EPSILON = EPSILON;
 
 void runTests()	
 {
@@ -51,16 +59,32 @@ int main(int argc, char *argv[])
 	
 	//=================== 參數設置（開始）===================
 	// 場景和輸出設置
-	std::string sceneName = "cornell-box";  // 場景名稱: cornell-box, house 等
-	std::string filename = "cornell-box-render.hdr"; // 輸出文件名
+	std::string sceneName = "Scenes1/bathroom";  // 場景名稱: cornell-box, house 等
+	std::string filename = "materials-scene-render.hdr"; // 輸出文件名
 	
-	// 渲染質量設置
-	unsigned int SPP = 32;    // 每像素採樣數
-	int renderMode = 1;       // 渲染模式: 1=路徑追蹤, 2=直接光照, 3=僅顯示顏色, 4=顯示法線
-	int maxPathDepth = 6;    // 路徑追蹤最大反射深度
-	bool useMultithread = true; // 是否啟用多線程渲染
-	bool useAdaptiveSampling = true; // 是否啟用自適應採樣
-	int tileSize = 16;  // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
+	//-------------- 渲染質量設置 --------------
+	unsigned int SPP = 64;                  // 每像素採樣數
+	int renderMode = 1;                     // 渲染模式: 1=路徑追蹤, 2=直接光照, 3=僅顯示顏色, 4=顯示法線
+	int maxPathDepth = 4;                  // 路徑追蹤最大反射深度
+	bool useMultithread = true;             // 是否啟用多線程渲染
+	bool useAdaptiveSampling = true;        // 是否啟用自適應採樣
+	int tileSize = 16;                      // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
+	float varianceThreshold = 0.001f;        // 自適應採樣閾值 - 較低的值提供更準確的結果但需要更多樣本
+	bool enableMIS = false;                  // 是否啟用多重重要性采樣
+	bool enableEnvImportanceSampling = true; // 是否啟用環境光重要性采樣
+	
+	//-------------- 線程設置 --------------
+	int threadCount = 0;                    // 渲染線程數 (0=自動使用系統核心數-1)
+	
+	//-------------- 光線交互設置 --------------
+	float rayEpsilon = 0.001f;              // 光線偏移量，防止自相交和陰影痤瘡
+	                                        // 太小會導致自相交，太大會導致漏光和錯誤陰影
+	
+	//-------------- BVH加速結構設置 --------------
+	int maxNodeTriangles = 8;               // 每個BVH葉節點最大三角形數
+	float traverseCost = 1.0f;              // 遍歷BVH節點的計算成本估計
+	float triangleCost = 2.0f;              // 三角形相交測試的計算成本估計
+	int buildBins = 16;                     // BVH構建時的空間分割數
 	
 	// 性能監控變量（無需修改）
 	double totalRenderTime = 0.0;
@@ -125,6 +149,26 @@ int main(int argc, char *argv[])
 			{
 				tileSize = stoi(pair.second);
 			}
+			if (pair.first == "-threadCount")
+			{
+				threadCount = stoi(pair.second);
+			}
+			if (pair.first == "-rayEpsilon")
+			{
+				rayEpsilon = stof(pair.second);
+			}
+			if (pair.first == "-varianceThreshold")
+			{
+				varianceThreshold = stof(pair.second);
+			}
+			if (pair.first == "-enableMIS")
+			{
+				enableMIS = (pair.second == "true");
+			}
+			if (pair.first == "-enableEnvImportanceSampling")
+			{
+				enableEnvImportanceSampling = (pair.second == "true");
+			}
 		}
 	}
 	Scene* scene = loadScene(sceneName);
@@ -165,11 +209,33 @@ int main(int argc, char *argv[])
 	rt.multithreaded = useMultithread;
 	rt.adaptiveSampling = useAdaptiveSampling;
 	rt.tileSize = tileSize;
+	rt.varianceThreshold = varianceThreshold; // 設置自適應採樣閾值
+	rt.setEnableMIS(enableMIS);
+	rt.setEnableImportanceSamplingEnv(enableEnvImportanceSampling);
 	
-	bool running = true;
-	GamesEngineeringBase::Timer timer;
-	GamesEngineeringBase::Timer totalTimer;
-	totalTimer.reset();
+	// 應用線程數設置
+	if (threadCount > 0) {
+		rt.numProcs = threadCount;  // 設置指定線程數
+	}
+	
+	// 自动调整SPP - 当启用MIS和环境光重要性采样时，可以使用更少的样本获得相同质量
+	if (enableMIS && enableEnvImportanceSampling && SPP > 16) {
+		int originalSPP = rt.SPP;
+		// 简化调整逻辑 - 使用更简单的数学计算
+		int newSPP = originalSPP / 2; // 简单直接减半
+		if (newSPP < 16) newSPP = 16; // 设置最小值保证质量
+		
+		rt.SPP = newSPP;
+		std::cout << "注意: 由于启用了MIS和环境光重要性采样，自动将SPP从 " << originalSPP 
+		          << " 减少到 " << rt.SPP << " (可获得相似质量但速度更快)" << std::endl;
+	}
+	
+	// 設置BVH和光線偏移量參數
+	USE_MAX_TRIANGLES = maxNodeTriangles;
+	USE_TRAVERSE_COST = traverseCost;
+	USE_TRIANGLE_COST = triangleCost;
+	USE_BUILD_BINS = buildBins;
+	RAY_EPSILON = rayEpsilon;
 	
 	// 场景初始化完成，打印场景信息
 	printHeader("SCENE INFORMATION");
@@ -186,6 +252,12 @@ int main(int argc, char *argv[])
 	// BVH信息（如果可用）
 	printRow("BVH Depth", std::to_string(scene->bvh->getDepth()));
 	printRow("BVH Node Count", std::to_string(scene->bvh->getNodeCount()));
+	printRow("BVH Max Triangles", std::to_string(maxNodeTriangles));
+	
+	// 其他渲染參數信息
+	printRow("Thread Mode", threadCount == 0 ? "Auto" : std::to_string(threadCount));
+	printRow("Ray Epsilon", std::to_string(rayEpsilon));
+	printRow("Variance Threshold", std::to_string(varianceThreshold));
 	
 	printSeparator();
 	
@@ -202,7 +274,14 @@ int main(int argc, char *argv[])
 	std::cout << " - Adaptive Sampling: " << (rt.adaptiveSampling ? "Enabled" : "Disabled") << std::endl;
 	std::cout << " - Tile Size: " << rt.tileSize << "x" << rt.tileSize << std::endl;
 	std::cout << " - Target SPP: " << rt.SPP << std::endl;
+	std::cout << " - Enable MIS: " << (rt.isEnableMIS() ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Enable Environment Importance Sampling: " << (rt.isEnableImportanceSamplingEnv() ? "Enabled" : "Disabled") << std::endl;
 	std::cout << std::endl;
+	
+	bool running = true;
+	GamesEngineeringBase::Timer timer;
+	GamesEngineeringBase::Timer totalTimer;
+	totalTimer.reset();
 	
 	while (running)
 	{

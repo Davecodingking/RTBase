@@ -1,0 +1,54 @@
+Build started at 12:51 AM...
+1>------ Build started: Project: RTBase, Configuration: Release x64 ------
+1>Main.cpp
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Core.h(210,11): error C2662: 'float Vec3::length(void)': cannot convert 'this' pointer from 'const Vec3' to 'Vec3 &'
+1>(compiling source file 'Main.cpp')
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Core.h(210,9):
+1>    Conversion loses qualifiers
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Core.h(168,8):
+1>    see declaration of 'Vec3::length'
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Core.h(210,11):
+1>    while trying to match the argument list '()'
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Geometry.h(363,19): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Geometry.h(407,13): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Geometry.h(527,19): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Geometry.h(569,12): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Imaging.h(215,23): warning C4018: '<': signed/unsigned mismatch
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Imaging.h(215,48): warning C4018: '<': signed/unsigned mismatch
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Imaging.h(223,21): warning C4018: '<': signed/unsigned mismatch
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(296,27): error C2589: '(': illegal token on right side of '::'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(296,27): error C2059: syntax error: ')'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(297,20): error C2676: binary '+=': 'Colour' does not define this operator or a conversion to a type acceptable to the predefined operator
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(331,27): error C2589: '(': illegal token on right side of '::'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(331,27): error C2059: syntax error: ')'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(332,20): error C2676: binary '+=': 'Colour' does not define this operator or a conversion to a type acceptable to the predefined operator
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(363,43): error C2664: 'ShadingData Scene::calculateShadingData(IntersectionData,Ray &)': cannot convert argument 2 from 'Ray' to 'Ray &'
+1>(compiling source file 'Main.cpp')
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(363,76):
+1>    A non-const reference may only be bound to an lvalue
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Scene.h(223,14):
+1>    see declaration of 'Scene::calculateShadingData'
+1>    C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(363,43):
+1>    while trying to match the argument list '(IntersectionData, Ray)'
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(380,28): error C2589: '(': illegal token on right side of '::'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(380,28): error C2059: syntax error: ')'
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(381,21): error C2676: binary '+=': 'Colour' does not define this operator or a conversion to a type acceptable to the predefined operator
+1>(compiling source file 'Main.cpp')
+1>C:\Users\u5615827\Downloads\RTBase-main\RTBase\Renderer.h(737,31): warning C4018: '>=': signed/unsigned mismatch
+1>(compiling source file 'Main.cpp')
+1>Done building project "RTBase.vcxproj" -- FAILED.

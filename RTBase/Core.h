@@ -90,6 +90,11 @@ public:
 	{
 		return ((0.2126f * r) + (0.7152f * g) + (0.0722f * b));
 	}
+	
+	Colour applyFunc(float (*func)(float)) const
+	{
+		return Colour(func(r), func(g), func(b));
+	}
 };
 
 class Vec3
@@ -178,7 +183,6 @@ static float Dot(const Vec3 v1, const Vec3 v2)
 	return ((v1.x * v2.x) + (v1.y * v2.y) + (v1.z * v2.z));
 }
 
-
 static Vec3 Cross(const Vec3& v1, const Vec3& v2)
 {
 	return Vec3((v1.y * v2.z) - (v1.z * v2.y), (v1.z * v2.x) - (v1.x * v2.z), (v1.x * v2.y) - (v1.y * v2.x));
@@ -192,6 +196,20 @@ static Vec3 Max(Vec3 a, Vec3 b)
 static Vec3 Min(Vec3 a, Vec3 b)
 {
 	return Vec3(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z);
+}
+
+class SceneBounds
+{
+public:
+	Vec3 sceneCentre;
+	float sceneRadius;
+};
+
+template<typename T>
+T& use()
+{
+	static T t;
+	return t;
 }
 
 struct Vertex

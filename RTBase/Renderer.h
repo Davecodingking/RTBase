@@ -4,6 +4,8 @@
 #include "Sampling.h"
 #include "Geometry.h"
 #include "Imaging.h"
+
+// 移除前向聲明，直接使用完整定義
 #include "Materials.h"
 #include "Lights.h"
 #include "Scene.h"
@@ -159,6 +161,10 @@ public:
 	int SPP = 20;       // 默認目標樣本數
 	int maxPathDepth = 10; // 路徑追蹤最大深度
 	
+	// MIS相关控制参数
+	bool enableMIS = true; // 控制是否使用MIS
+	bool enableImportanceSamplingEnv = true; // 控制是否使用环境光重要性采样
+	
 	// 新增的多線程和自適應採樣相關變量
 	unsigned int tileSize = 64; // 默認tile大小
 	std::vector<Tile*> tiles;   // 所有tile的集合
@@ -167,6 +173,7 @@ public:
 	std::mutex filmMutex;       // 保護film的互斥鎖
 	bool adaptiveSampling = true; // 是否啟用自適應採樣
 	bool multithreaded = true;   // 是否啟用多線程渲染
+	float varianceThreshold = 0.05f; // 自適應採樣閾值
 	
 	// 設置渲染模式
 	void setRenderMode(int mode) {
@@ -204,6 +211,30 @@ public:
 		if (canvas) {
 			canvas->clear();
 		}
+		
+		// 预处理场景信息，加速渲染判断
+		preProcessScene();
+	}
+	
+	// 预处理场景信息，提取关键特征以加速渲染
+	void preProcessScene() {
+		// 1. 初始化环境光重要性采样
+		if (scene && scene->background) {
+			EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+			if (envMap) {
+				envMap->enableImportanceSampling = enableImportanceSamplingEnv;
+			}
+		}
+		
+		// 2. 如果场景复杂度低，自动减少SPP (如果还没通过其他方式减少)
+		bool isSimpleScene = (scene->lights.size() <= 1 && 
+		                      scene->background->totalIntegratedPower() < 0.1f);
+		
+		if (isSimpleScene && SPP > 32) {
+			int originalSPP = SPP;
+			SPP = (SPP * 3) / 4; // 减少25%的样本数
+			std::cout << "简单场景自动优化: SPP从" << originalSPP << "减少到" << SPP << std::endl;
+		}
 	}
 	
 	void clear()
@@ -224,39 +255,35 @@ public:
 	
 	Colour computeDirect(ShadingData shadingData, Sampler* sampler)
 	{
-		// Is surface is specular we cannot computing direct lighting
-		if (shadingData.bsdf->isPureSpecular() == true)
+		// 提前检查 - 镜面材质不计算直接光照
+		if (shadingData.bsdf->isPureSpecular())
 		{
 			return Colour(0.0f, 0.0f, 0.0f);
 		}
 		
+		// 预先检查是否需要BSDF采样 - 只检查一次条件，避免重复判断
+		bool needsBSDFSampling = enableMIS &&  // MIS开关打开
+		                         !shadingData.bsdf->isPureSpecular() && // 非纯镜面材质
+		                         (scene->background->totalIntegratedPower() > 0.1f || // 有明显的环境光贡献
+		                          scene->lights.size() > 1); // 或多个光源
+		
 		// 计算直接光照
 		Colour L(0.0f, 0.0f, 0.0f);
 		
-		// 遍历所有光源
+		// 第一部分：通过光源采样计算直接光照贡献
 		for (int i = 0; i < scene->lights.size(); i++)
 		{
 			// 获取光源采样信息
 			Colour emissionColour;
-			float pdf;
-			Vec3 lightDirection = scene->lights[i]->sample(shadingData, sampler, emissionColour, pdf);
+			float lightPdf;
+			Vec3 lightDirection = scene->lights[i]->sample(shadingData, sampler, emissionColour, lightPdf);
 			
-			// 忽略概率为0的采样
-			if (pdf <= 0.0f) continue;
+			// 快速预检查：忽略无效采样
+			if (lightPdf <= 0.0f) continue;
 			
 			// 计算几何项（方向是否在法线同一侧）
 			float nDotWi = Dot(shadingData.sNormal, lightDirection);
 			if (nDotWi <= 0.0f) continue;  // 光源在背面，忽略
-			
-			// 计算光源方向传播的最大距离
-			float lightDistance = 1000.0f; // 使用足够大的距离
-			
-			// 检查可见性（阴影测试）
-			Ray shadowRay;
-			shadowRay.init(shadingData.x + lightDirection * EPSILON, lightDirection);
-			
-			// 直接使用可见性测试函数
-			if (!scene->visible(shadingData.x, shadingData.x + lightDirection * lightDistance)) continue;
 			
 			// 计算BSDF贡献
 			Colour f = shadingData.bsdf->evaluate(shadingData, lightDirection);
@@ -264,8 +291,114 @@ public:
 			// 确保f不是全黑的
 			if (f.r <= 0.0f && f.g <= 0.0f && f.b <= 0.0f) continue;
 			
-			// 累加贡献 - 应用几何项和PDF
-			L = L + f * emissionColour * (nDotWi / pdf);
+			// 计算光源方向传播的最大距离
+			float lightDistance = 1000.0f; // 使用足够大的距离
+			
+			// 检查可见性（阴影测试）
+			if (!scene->visible(shadingData.x, shadingData.x + lightDirection * lightDistance)) continue;
+			
+			// 简化MIS决策 - 只有在需要BSDF采样的情况下才使用MIS
+			// 对于区域光总是使用MIS以提高采样质量
+			bool useMisForLight = needsBSDFSampling || scene->lights[i]->isArea();
+			
+			if (useMisForLight) {
+				// 计算BSDF的PDF值，用于MIS权重计算
+				float bsdfPdf = shadingData.bsdf->PDF(shadingData, lightDirection);
+				
+				// 使用幂启发式计算MIS权重
+				float weight = SamplingDistributions::powerHeuristic(lightPdf, bsdfPdf);
+				
+				// 累加贡献 - 应用几何项，PDF和MIS权重
+				L = L + f * emissionColour * (nDotWi * weight / lightPdf);
+			} else {
+				// 对于简单情况，直接使用光源采样
+				L = L + f * emissionColour * (nDotWi / lightPdf);
+			}
+		}
+		
+		// 第二部分：通过BSDF采样计算直接光照贡献
+		// 如果不需要BSDF采样，直接返回
+		if (!needsBSDFSampling) {
+			return L;
+		}
+		
+		// BSDF采样部分
+		Colour bsdfColour;
+		float bsdfPdf;
+		Vec3 bsdfDirection = shadingData.bsdf->sample(shadingData, sampler, bsdfColour, bsdfPdf);
+		
+		// 检查采样是否有效
+		if (bsdfPdf <= 0.0f || (bsdfColour.r <= 0.0f && bsdfColour.g <= 0.0f && bsdfColour.b <= 0.0f)) {
+			return L;
+		}
+		
+		// 检查几何项
+		float nDotWi = Dot(shadingData.sNormal, bsdfDirection);
+		if (nDotWi <= 0.0f) {
+			return L;
+		}
+		
+		// 创建射线
+		Ray bsdfRay;
+		bsdfRay.init(shadingData.x + bsdfDirection * RAY_EPSILON, bsdfDirection);
+		
+		// 检查是否击中光源
+		IntersectionData hitInfo = scene->traverse(bsdfRay);
+		
+		if (hitInfo.t < FLT_MAX)
+		{
+			// 计算着色数据
+			ShadingData lightShadingData = scene->calculateShadingData(hitInfo, bsdfRay);
+			
+			// 检查是否是光源
+			if (lightShadingData.bsdf->isLight())
+			{
+				// 获取光源发射值
+				Colour emissionColour = lightShadingData.bsdf->emit(lightShadingData, -bsdfDirection);
+				
+				// 快速预检查：忽略黑色光源
+				if (emissionColour.r <= 0.0f && emissionColour.g <= 0.0f && emissionColour.b <= 0.0f) {
+					return L;
+				}
+				
+				// 找到对应的光源 - 仅检查区域光
+				for (int i = 0; i < scene->lights.size(); i++)
+				{
+					if (scene->lights[i]->isArea())
+					{
+						// 计算光源的采样PDF
+						float lightPdf = scene->lights[i]->PDF(lightShadingData, -bsdfDirection);
+						
+						// 使用MIS权重
+						float weight = SamplingDistributions::powerHeuristic(bsdfPdf, lightPdf);
+						
+						// 累加贡献
+						L = L + bsdfColour * emissionColour * (nDotWi * weight / bsdfPdf);
+						break;
+					}
+				}
+			}
+		}
+		else if (scene->background != nullptr && scene->background->totalIntegratedPower() > 0.1f)
+		{
+			// 处理环境光/背景光
+			Colour emissionColour = scene->background->evaluate(shadingData, bsdfDirection);
+			
+			// 优化：如果环境光是黑色的，跳过后续计算
+			if (emissionColour.r <= 0.0f && emissionColour.g <= 0.0f && emissionColour.b <= 0.0f) {
+				return L;
+			}
+			
+			float lightPdf = scene->background->PDF(shadingData, bsdfDirection);
+			
+			// 防止除零错误
+			if (lightPdf > 0.0f) {
+				// 使用MIS权重
+				float weight = SamplingDistributions::powerHeuristic(bsdfPdf, lightPdf);
+				
+				// 累加贡献
+				L = L + bsdfColour * emissionColour * (nDotWi * weight / bsdfPdf);
+			}
 		}
 		
 		// 确保返回值不是NaN
@@ -325,7 +458,7 @@ public:
 		
 		// 创建新的光线
 		Ray nextRay;
-		nextRay.init(shadingData.x + wi * EPSILON, wi);
+		nextRay.init(shadingData.x + wi * RAY_EPSILON, wi);
 		
 		// 递归获取间接光照
 		Colour bounceLight = pathTrace(nextRay, pathThroughput, depth + 1, sampler);
@@ -333,8 +466,17 @@ public:
 		// 应用BSDF和几何项 - indirect现在表示BSDF评估结果
 		Colour indirectContribution = indirect * bounceLight * (cosTheta / (pdf * continueProb));
 		
-		// 返回直接光照和间接光照的和
-		return directLight + indirectContribution;
+		// 計算直接光照和間接光照的和
+		Colour result = directLight + indirectContribution;
+		
+		// 限制極端值，防止白點產生
+		const float maxValue = 10.0f; // 設置顏色值的上限
+		if (result.r > maxValue) result.r = maxValue;
+		if (result.g > maxValue) result.g = maxValue;
+		if (result.b > maxValue) result.b = maxValue;
+		
+		// 返回結果
+		return result;
 	}
 	
 	Colour direct(Ray& r, Sampler* sampler)
@@ -380,8 +522,14 @@ public:
 		
 		// 确保结果至少有最小亮度
 		if (result.r <= 0.01f && result.g <= 0.01f && result.b <= 0.01f) {
-			return albedoColor * 0.1f; // 返回暗淡的材质颜色
+			return albedoColor * 0.1f; // 返回暗淡的材質颜色
 		}
+		
+		// 限制極端值
+		const float maxValue = 10.0f; // 設置顏色值的上限
+		if (result.r > maxValue) result.r = maxValue;
+		if (result.g > maxValue) result.g = maxValue;
+		if (result.b > maxValue) result.b = maxValue;
 		
 		return result;
 	}
@@ -435,7 +583,7 @@ public:
 				
 				// 創建新的tile並添加到列表中
 				Tile* tile = new Tile(startX, startY, endX, endY);
-				tile->varianceThreshold = 0.05f; // 提高閾值，減少採樣數
+				tile->varianceThreshold = this->varianceThreshold; // 使用成員變數設置閾值
 				tiles.push_back(tile);
 			}
 		}
@@ -684,6 +832,12 @@ public:
 						tile->squaredBuffer[index] = tile->squaredBuffer[index] + (pixelColour * pixelColour);
 					}
 					
+					// 限制極端值，防止白點產生和累積
+					const float maxValue = 10.0f; // 設置顏色值的上限
+					if (pixelColour.r > maxValue) pixelColour.r = maxValue;
+					if (pixelColour.g > maxValue) pixelColour.g = maxValue;
+					if (pixelColour.b > maxValue) pixelColour.b = maxValue;
+					
 					// 更新film，但不直接更新畫面（避免線程衝突）
 					{
 						std::lock_guard<std::mutex> lock(filmMutex);
@@ -707,98 +861,17 @@ public:
 	
 	void render()
 	{
-		if (multithreaded) {
-			renderMultithreaded();
-			return;
-		}
+		// 渲染前初始化优化设置
+		preRender();
 		
-		// 原始的單線程渲染代碼，保持不變
-		// 增加樣本計數但不清空畫面
-		film->incrementSPP();
-		std::cout << "Adding sample " << film->SPP << "/" << SPP << "..." << std::endl;
+		// 如果没有场景或者film，则返回
+		if (!scene || !film) return;
 		
-		// 創建所有像素坐標的向量
-		std::vector<std::pair<unsigned int, unsigned int>> pixels;
-		for (unsigned int y = 0; y < film->height; y++) {
-			for (unsigned int x = 0; x < film->width; x++) {
-				pixels.push_back(std::make_pair(x, y));
-			}
-		}
+		// 清空film中的数据
+		clear();
 		
-		// 隨機打亂像素順序，實現漸進式渲染
-		std::random_device rd;
-		std::mt19937 g(rd());
-		std::shuffle(pixels.begin(), pixels.end(), g);
-		
-		// 處理進度計數
-		int processed = 0;
-		int totalPixels = (int)pixels.size();
-		int lastPercent = 0;
-		
-		// 處理所有像素
-		for (const auto& pixel : pixels)
-		{
-			unsigned int x = pixel.first;
-			unsigned int y = pixel.second;
-			
-			float px = x + 0.5f;
-			float py = y + 0.5f;
-			Ray ray = scene->camera.generateRay(px, py);
-
-			// 根据需要选择合适的渲染方法
-			Colour col;
-			
-			// 通过renderMode变量选择渲染模式
-			switch (renderMode) {
-				case 1: // 路径追踪（最慢但最真实）
-					{
-						Colour pathThroughput(1.0f, 1.0f, 1.0f);
-						col = pathTrace(ray, pathThroughput, 0, &samplers[0]);
-						break;
-					}
-					
-				case 2: // 直接光照（速度适中）
-					col = direct(ray, &samplers[0]);
-					break;
-					
-				case 3: // Albedo（最简单最快）
-					col = albedo(ray);
-					break;
-					
-				case 4: // 查看法线（调试用）
-					col = viewNormals(ray);
-					break;
-					
-				default: // 默认使用直接光照
-					col = direct(ray, &samplers[0]);
-					break;
-			}
-			
-			// 添加样本到胶片
-			film->splat(px, py, col);
-			
-			// 立即更新顯示
-			unsigned char r, g, b;
-			film->tonemap(x, y, r, g, b);
-			canvas->draw(x, y, r, g, b);
-			
-			// 更新处理进度
-			processed++;
-			int percent = (processed * 100) / totalPixels;
-			if (percent > lastPercent) {
-				lastPercent = percent;
-				std::cout << "\rProgress: " << percent << "%" << std::flush;
-				
-				// 定期更新畫面
-				if (percent % 5 == 0) {
-					canvas->present();
-				}
-			}
-		}
-		
-		// 最終更新畫面
-		canvas->present();
-		std::cout << "\rProgress: 100%" << std::endl;
+		// 使用多线程渲染
+		renderMultithreaded();
 	}
 	
 	void saveHDR(std::string filename)
@@ -809,5 +882,42 @@ public:
 	void savePNG(std::string filename)
 	{
 		film->saveTonemappedPNG(filename, 1.0f);
+	}
+	
+	// 设置控制参数的方法
+	void setEnableMIS(bool enable) {
+		enableMIS = enable;
+	}
+	
+	bool isEnableMIS() const {
+		return enableMIS;
+	}
+	
+	void setEnableImportanceSamplingEnv(bool enable) {
+		enableImportanceSamplingEnv = enable;
+		
+		// 更新环境光的重要性采样设置
+		if (scene && scene->background) {
+			EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+			if (envMap) {
+				envMap->enableImportanceSampling = enable;
+			}
+		}
+	}
+	
+	bool isEnableImportanceSamplingEnv() const {
+		return enableImportanceSamplingEnv;
+	}
+	
+	// 渲染前的初始化，设置场景中的环境光采样控制
+	void preRender() {
+		// 如果场景存在，直接设置环境光采样开关
+		if (scene && scene->background) {
+			EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+			if (envMap) {
+				// 直接设置而不是在每次采样时判断
+				envMap->enableImportanceSampling = enableImportanceSamplingEnv;
+			}
+		}
 	}
 };

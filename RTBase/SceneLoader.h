@@ -2,6 +2,7 @@
 
 // Do not change any of this!
 
+#include "Core.h"
 #include "GEMLoader.h"
 #include "Renderer.h"
 
@@ -286,5 +287,7 @@ Scene* loadScene(std::string sceneName)
 	scene->init(meshTriangles, meshMaterials, background);
 	viewcamera.movespeed = (scene->bounds.max - scene->bounds.min).length() * 0.05f;
 	scene->build();
+	use<SceneBounds>().sceneCentre = (scene->bounds.max + scene->bounds.min) * 0.5f;
+	use<SceneBounds>().sceneRadius = (scene->bounds.max - use<SceneBounds>().sceneCentre).length();
 	return scene;
 }

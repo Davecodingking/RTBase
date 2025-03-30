@@ -65,4 +65,20 @@ public:
 		// 均匀球体的PDF = 1 / (4 * pi)
 		return 1.0f / (4.0f * M_PI);
 	}
+	
+	// 平衡启发式(balance heuristic)的MIS权重计算
+	static float balanceHeuristic(float pdfA, float pdfB)
+	{
+		if (pdfA <= 0.0f) return 0.0f;
+		return pdfA / (pdfA + pdfB);
+	}
+	
+	// 幂启发式(power heuristic)的MIS权重计算，默认使用beta=2
+	static float powerHeuristic(float pdfA, float pdfB, float beta = 2.0f)
+	{
+		if (pdfA <= 0.0f) return 0.0f;
+		float pdfAPow = powf(pdfA, beta);
+		float pdfBPow = powf(pdfB, beta);
+		return pdfAPow / (pdfAPow + pdfBPow);
+	}
 };

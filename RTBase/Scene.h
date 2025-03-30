@@ -8,6 +8,12 @@
 #include "Lights.h"
 #include <chrono>
 
+// 前向聲明
+class BSDF;
+class ShadingData;
+class Light;
+class AreaLight;
+
 class Camera
 {
 public:
@@ -18,18 +24,27 @@ public:
 	float width = 0;
 	float height = 0;
 	Vec3 origin;
+	Vec3 viewDirection;
+	float Afilm;
 	void init(Matrix ProjectionMatrix, int screenwidth, int screenheight)
 	{
 		projectionMatrix = ProjectionMatrix;
 		inverseProjectionMatrix = ProjectionMatrix.invert();
 		width = (float)screenwidth;
 		height = (float)screenheight;
+		float Wlens = (2.0f / ProjectionMatrix.a[1][1]);
+		float aspect = ProjectionMatrix.a[0][0] / ProjectionMatrix.a[1][1];
+		float Hlens = Wlens * aspect;
+		Afilm = Wlens * Hlens;
 	}
 	void updateView(Matrix V)
 	{
 		camera = V;
 		cameraToView = V.invert();
 		origin = camera.mulPoint(Vec3(0, 0, 0));
+		viewDirection = inverseProjectionMatrix.mulPointAndPerspectiveDivide(Vec3(0, 0, 1));
+		viewDirection = camera.mulVec(viewDirection);
+		viewDirection = viewDirection.normalize();
 	}
 	// Add code here
 	Ray generateRay(float x, float y)
@@ -113,7 +128,7 @@ public:
 				AreaLight* light = new AreaLight();
 				light->triangle = &triangles[i];
 				light->emission = materials[triangles[i].materialIndex]->emission;
-				lights.push_back(light);
+				lights.push_back(static_cast<Light*>(light));
 			}
 		}
 	}
@@ -184,9 +199,9 @@ public:
 	{
 		Ray ray;
 		Vec3 dir = p2 - p1;
-		float maxT = dir.length() - (2.0f * EPSILON);
+		float maxT = dir.length() - (2.0f * RAY_EPSILON);
 		dir = dir.normalize();
-		ray.init(p1 + (dir * EPSILON), dir);
+		ray.init(p1 + (dir * RAY_EPSILON), dir);
 		return bvh->traverseVisible(ray, triangles, maxT);
 	}
 	Colour emit(Triangle* light, ShadingData shadingData, Vec3 wi)
