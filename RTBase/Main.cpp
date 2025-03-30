@@ -49,6 +49,9 @@ std::string getRenderModeName(int mode) {
 		case 2: return "Direct Lighting";
 		case 3: return "Albedo Only";
 		case 4: return "Normal Visualization";
+		case 5: return "Instant Radiosity";
+		case 6: return "VPL Indirect Only";
+		case 7: return "VPL Visualization";
 		default: return "Unknown";
 	}
 }
@@ -114,6 +117,11 @@ int main(int argc, char *argv[])
 	bool enableEnvImportanceSampling = true; // 是否啟用環境光重要性采樣
 	bool enableDenoising = true;            // 是否启用OIDN降噪
 	bool saveAOVs = true;                   // 是否保存AOV（法线、反照率）文件
+	
+	//-------------- Instant Radiosity设置 --------------
+	bool enableIR = false;                  // 是否启用Instant Radiosity
+	int numVPLs = 500;                      // VPL数量
+	float vplClampThreshold = 0.1f;         // VPL强度截断阈值
 	
 	//-------------- 線程設置 --------------
 	int threadCount = 0;                    // 渲染線程數 (0=自動使用系統核心數-1)
@@ -219,6 +227,18 @@ int main(int argc, char *argv[])
 			{
 				saveAOVs = (pair.second == "true");
 			}
+			if (pair.first == "-enableIR")
+			{
+				enableIR = (pair.second == "true");
+			}
+			if (pair.first == "-numVPLs")
+			{
+				numVPLs = stoi(pair.second);
+			}
+			if (pair.first == "-vplClampThreshold")
+			{
+				vplClampThreshold = stof(pair.second);
+			}
 		}
 	}
 	Scene* scene = loadScene(sceneName);
@@ -263,6 +283,11 @@ int main(int argc, char *argv[])
 	rt.setEnableMIS(enableMIS);
 	rt.setEnableImportanceSamplingEnv(enableEnvImportanceSampling);
 	rt.setEnableDenoising(enableDenoising); // 设置是否启用降噪
+	
+	// 设置IR相关参数
+	rt.setEnableIR(enableIR);
+	rt.setNumVPLs(numVPLs);
+	rt.vplClampThreshold = vplClampThreshold;
 	
 	// 應用線程數設置
 	if (threadCount > 0) {
@@ -329,6 +354,9 @@ int main(int argc, char *argv[])
 	std::cout << " - Enable Environment Importance Sampling: " << (rt.isEnableImportanceSamplingEnv() ? "Enabled" : "Disabled") << std::endl;
 	std::cout << " - Enable Denoising: " << (enableDenoising ? "Enabled" : "Disabled") << std::endl;
 	std::cout << " - Save AOVs: " << (saveAOVs ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Enable IR: " << (enableIR ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Num VPLs: " << numVPLs << std::endl;
+	std::cout << " - VPL Clamp Threshold: " << vplClampThreshold << std::endl;
 	std::cout << std::endl;
 	
 	bool running = true;
@@ -489,5 +517,14 @@ int main(int argc, char *argv[])
 		// 简单延时以减少CPU使用率
 		Sleep(16); // 约60FPS
 	}
+
+	// 显示完整的帮助信息
+	std::cout << "Command Line Usage Examples:" << std::endl;
+	std::cout << "  RTBase.exe -scene Scenes1/bathroom -SPP 64 -renderMode 1" << std::endl;
+	std::cout << "  RTBase.exe -scene cornell-box -SPP 128 -renderMode 2 -useMultithread true -enableMIS true" << std::endl;
+	std::cout << "  RTBase.exe -scene MaterialsScene -SPP 256 -renderMode 1 -enableDenoising true -maxPathDepth 5" << std::endl;
+	std::cout << "  RTBase.exe -scene cornell-box -SPP 64 -renderMode 5 -enableIR true -numVPLs 1000" << std::endl;
+	std::cout << "  RTBase.exe -scene Scenes1/bathroom -SPP 32 -renderMode 6 -enableIR true -vplClampThreshold 0.05" << std::endl;
+
 	return 0;
 }

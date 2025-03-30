@@ -1,178 +1,214 @@
-1	Implementation (85 Marks)
-This section provides details of the type of algorithms which can be implemented as part of this coursework. We developed a path tracer during the in-class sessions, and it is expected that you will build on this to add further functionality. This assessment is split into two parts: one which extends the functionality of the path tracer, and the second which adds other light transport algorithms.
+### Photon Mapping 实现详解（基于《RenderingAlgorithms.pdf》页面 118-177）
 
-Extending the functionality of the path tracer (35 Marks):
+---
 
--	Add more materials:
-o	Add a GGX Microfacet BRDF (Evaluation and sampling proportional to the NDF) 
-o	Add a Glass BRDF
--	Exploit techniques to speed up render times
-o	Use multiple threads to perform tile based rendering
-o	Implement a tile based adaptive sampler
-o	Integrate an existing denoiser into the renderer (Intel Open Image Denoise is recommended, you will need to render AOVs for this)
--	Add environment lighting
-o	Implement sampling and evaluating environment maps stored in latitude-longitude format
-o	Combine with MIS to reduce variance
-The second part of the coding assessment is the addition of other light transport or sampling algorithms. Each of these has a weight based on its implementation difficulty and they are grouped by common features and implementation challenge. Please choose one group to implement for this assessment. If you would like to implement an algorithm not on this list, please speak to the module tutor.
+#### **1. Photon Mapping 核心概念（页面 118-120）**
+Photon Mapping 是两步法全局光照算法：
+1. **光子发射与存储**：从光源发射光子，追踪其与场景的交互，并在漫反射表面存储光子。
+2. **密度估计**：从相机出发，利用存储的光子图估算间接光照。
 
-The groups are as follows:
+光子分类存储：
+- **全局光子图**：经过任意次反射后存储在漫反射表面的光子。
+- **焦散光子图**：经过至少一次镜面反射后存储在漫反射表面的光子。
+- **体积光子图**：参与介质中的光子。
 
--	Instant Radiosity (25 Marks)
--	Irradiance Cache (25 Marks)                                                                        
-OR
+---
 
--	Instant Radiosity (25 Marks)
--	Photon Mapping (25 Marks)
+#### **2. 光子发射与追踪（页面 121-124）**
+**代码示例：光子结构定义与发射逻辑**
+```cpp
+struct Photon {
+    vec3 position;    // 光子位置
+    vec3 direction;   // 入射方向
+    vec3 power;       // 光子能量（RGB）
+    bool isDiffuse;   // 是否为漫反射交互
+};
 
-OR
+// 从光源发射光子
+void emitPhotons(Light* light, int numPhotons, std::vector<Photon>& globalMap, std::vector<Photon>& causticMap) {
+    for (int i = 0; i < numPhotons; i++) {
+        // 采样光源位置和方向
+        float pdfPos, pdfDir;
+        vec3 pos = light->samplePosition(pdfPos);
+        vec3 dir = light->sampleDirection(pdfDir);
+        vec3 throughput = light->getIntensity() / (pdfPos * pdfDir * numPhotons);
 
--	Instant Radiosity (25 Marks)
--	Light Tracing (25 Marks)
-OR
--	Progressive Photon Mapping (50 Marks)
-OR
--	Primary Sample Space Metropolis Light Transport (50 Marks)
-o	You can integrate with the path tracer, or any other algorithm if this is implemented
+        Ray ray(pos, dir);
+        tracePhoton(ray, throughput, globalMap, causticMap, 0);
+    }
+}
 
+// 递归追踪光子
+void tracePhoton(Ray ray, vec3 throughput, std::vector<Photon>& globalMap, std::vector<Photon>& causticMap, int depth) {
+    HitRecord hit = scene.intersect(ray);
+    if (!hit.valid) return;
 
-步骤1：在渲染器中生成AOV
-在着色阶段输出AOV：
-修改着色器代码，为每个像素额外输出法线、反照率、深度等信息。
+    // 仅在漫反射表面存储光子
+    if (hit.material.isDiffuse()) {
+        Photon photon;
+        photon.position = hit.position;
+        photon.direction = -ray.direction; // 入射方向的反方向
+        photon.power = throughput;
+        photon.isDiffuse = true;
+        globalMap.push_back(photon);
+    }
 
-cpp
-Copy
-// 伪代码示例：在着色器中生成AOV  
-struct ShadingData {  
-    vec3 color;     // 原始颜色（含噪声）  
-    vec3 albedo;    // 材质反照率（无光照）  
-    vec3 normal;    // 表面法线（世界空间）  
-    float depth;    // 深度值（相机空间）  
-};  
+    // 俄罗斯轮盘终止
+    float surviveProb = std::min(0.8f, throughput.maxComponent());
+    if (random() > surviveProb) return;
 
-// 在渲染循环中存储AOV到独立缓冲区  
-framebuffer.color[pixel] = shadingData.color;  
-framebuffer.albedo[pixel] = shadingData.albedo;  
-framebuffer.normal[pixel] = (shadingData.normal + 1.0) / 2.0; // 法线归一化到[0,1]  
-framebuffer.depth[pixel] = shadingData.depth;  
-注意事项：
+    // 采样下一方向（BSDF采样）
+    vec3 newDir = hit.material.sampleBSDF(hit.normal, -ray.direction);
+    Ray newRay(hit.position, newDir);
+    tracePhoton(newRay, throughput * hit.material.evalBSDF(newDir) / surviveProb, globalMap, causticMap, depth + 1);
+}
+```
 
-法线归一化：OIDN要求法线范围在 [0,1]，需将世界空间法线（范围 [-1,1]）映射到 [0,1]。
+---
 
-深度标准化：根据相机参数将深度值缩放到合理范围（如 [0,1]）。
+#### **3. 光子存储与加速结构（页面 126-130）**
+使用 **KD-Tree** 加速光子查询：
+```cpp
+class KDNode {
+public:
+    Photon photon;
+    KDNode* left;
+    KDNode* right;
+    int axis; // 划分轴（0=x, 1=y, 2=z）
+};
 
-步骤2：配置OIDN并绑定AOV
-初始化OIDN设备与过滤器：
+class KDTree {
+public:
+    KDNode* root;
+    void build(std::vector<Photon>& photons) {
+        // 递归划分光子位置，构建平衡KD-Tree
+        // 实现略（类似标准KD-Tree构建算法）
+    }
 
-cpp
-Copy
-#include <OpenImageDenoise/oidn.hpp>  
+    std::vector<Photon> queryRadius(const vec3& p, float radius) {
+        std::vector<Photon> result;
+        queryRadiusRecursive(root, p, radius, result);
+        return result;
+    }
 
-// 初始化OIDN设备  
-oidn::DeviceRef device = oidn::newDevice();  
-device.commit();  
+private:
+    void queryRadiusRecursive(KDNode* node, const vec3& p, float radius, std::vector<Photon>& result) {
+        if (!node) return;
+        float dist = (node->photon.position - p).length();
+        if (dist <= radius) result.push_back(node->photon);
+        // 递归左右子树
+        if (p[node->axis] - radius <= node->photon.position[node->axis])
+            queryRadiusRecursive(node->left, p, radius, result);
+        if (p[node->axis] + radius >= node->photon.position[node->axis])
+            queryRadiusRecursive(node->right, p, radius, result);
+    }
+};
 
-// 创建降噪过滤器（选择“RT”模式，适用于路径追踪）  
-oidn::FilterRef filter = device.newFilter("RT");  
-绑定AOV缓冲区：
+// 全局光子图和焦散光子图分别构建KD-Tree
+KDTree globalPhotonTree, causticPhotonTree;
+globalPhotonTree.build(globalMap);
+causticPhotonTree.build(causticMap);
+```
 
-cpp
-Copy
-// 假设已生成以下缓冲区（宽度width，高度height）  
-float* colorBuffer = framebuffer.color.data();  
-float* albedoBuffer = framebuffer.albedo.data();  
-float* normalBuffer = framebuffer.normal.data();  
-float* outputBuffer = new float[width * height * 3]; // 降噪后输出  
+---
 
-// 设置输入输出缓冲区  
-filter.setImage("color",  colorBuffer,  oidn::Format::Float3, width, height);  
-filter.setImage("albedo", albedoBuffer, oidn::Format::Float3, width, height);  
-filter.setImage("normal", normalBuffer, oidn::Format::Float3, width, height);  
-filter.setImage("output", outputBuffer, oidn::Format::Float3, width, height);  
+#### **4. 密度估计（页面 131-138）**
+使用核函数平滑光子密度，计算间接光照：
+```cpp
+vec3 estimateIndirectLight(vec3 position, vec3 normal, const KDTree& photonTree) {
+    float radius = 0.5f; // 动态调整半径
+    auto photons = photonTree.queryRadius(position, radius);
+    if (photons.empty()) return vec3(0);
 
-// 启用HDR（如果渲染结果为HDR）  
-filter.set("hdr", true);  
+    vec3 sum(0);
+    for (auto& photon : photons) {
+        // 核函数（Epanechnikov 核）
+        float dist = (photon.position - position).length();
+        float weight = 1.0f - (dist * dist) / (radius * radius);
+        weight = std::max(0.0f, weight);
 
-// 提交配置  
-filter.commit();  
-关键参数说明：
+        // 仅考虑法线方向的半球
+        if (dot(photon.direction, normal) > 0) {
+            vec3 bsdf = hit.material.evalBSDF(photon.direction);
+            sum += photon.power * bsdf * weight;
+        }
+    }
 
-oidn::Format::Float3：表示RGB三通道浮点数数据。
+    // 归一化
+    float area = M_PI * radius * radius;
+    return sum / (area * photons.size());
+}
+```
 
-hdr：若渲染结果为HDR（如OpenEXR格式），需设为 true。
+---
 
-步骤3：执行降噪并输出结果
-执行降噪：
+#### **5. 与路径追踪整合（页面 140-146）**
+在路径追踪中结合光子映射：
+```cpp
+vec3 pathTrace(Ray ray, int depth) {
+    if (depth > MAX_DEPTH) return vec3(0);
+    HitRecord hit = scene.intersect(ray);
+    if (!hit.valid) return environmentLight(ray.direction);
 
-cpp
-Copy
-filter.execute();  
+    // 直接光照（传统采样）
+    vec3 direct = sampleDirectLight(hit);
 
-// 检查错误  
-const char* errorMessage;  
-if (device.getError(errorMessage) {  
-    std::cerr << "OIDN Error: " << errorMessage << std::endl;  
-    exit(1);  
-}  
-保存/显示降噪图像：
+    // 间接光照（光子映射）
+    vec3 indirect(0);
+    if (hit.material.isDiffuse()) {
+        indirect += estimateIndirectLight(hit.position, hit.normal, globalPhotonTree);
+        indirect += estimateIndirectLight(hit.position, hit.normal, causticPhotonTree);
+    }
 
-cpp
-Copy
-// 将outputBuffer数据转换为图像格式（如OpenCV Mat）  
-cv::Mat denoisedImage(height, width, CV_32FC3, outputBuffer);  
-cv::imwrite("denoised.exr", denoisedImage);  
-步骤4：验证与调试
-检查AOV是否正确生成：
+    // 递归镜面反射
+    if (hit.material.isSpecular()) {
+        Ray reflected = sampleSpecular(hit);
+        return direct + hit.material.albedo * pathTrace(reflected, depth + 1);
+    }
 
-单独保存每个AOV通道并查看：
+    return direct + indirect;
+}
+```
 
-cpp
-Copy
-saveImage("normal.exr", framebuffer.normal);  
-saveImage("albedo.exr", framebuffer.albedo);  
-预期结果：
+---
 
-法线图应清晰显示物体表面朝向。
+#### **6. 优化与进阶（页面 152-177）**
+**最终聚集（Final Gathering）**：
+```cpp
+vec3 finalGathering(vec3 position, vec3 normal) {
+    vec3 sum(0);
+    int numSamples = 64;
+    for (int i = 0; i < numSamples; i++) {
+        vec3 dir = cosineSampleHemisphere(normal);
+        Ray ray(position, dir);
+        HitRecord secondaryHit = scene.intersect(ray);
+        if (secondaryHit.valid && secondaryHit.material.isDiffuse()) {
+            // 在次级命中点使用光子映射
+            sum += estimateIndirectLight(secondaryHit.position, secondaryHit.normal, globalPhotonTree);
+        }
+    }
+    return sum / numSamples;
+}
+```
 
-反照率图应为纯材质颜色（无阴影或高光）。
+**渐进式光子映射（Progressive Photon Mapping, PPM）**：
+- 每轮迭代发射少量光子并逐步缩小核半径。
+- 存储每个像素的统计信息（位置、半径、光子数、累计能量）。
 
-调试OIDN输入：
+---
 
-确保缓冲区尺寸、格式与OIDN要求一致。
+#### **7. 与用户已实现部分的整合**
+- **Radiosity**：Radiosity 适用于低频间接光照，而Photon Mapping擅长高频细节（如焦散）。可结合两者，用Radiosity计算大面积间接光，Photon Mapping补充细节。
+- **代码兼容性**：确保光子映射的KD-Tree与场景查询接口兼容，例如 `scene.intersect(ray)` 需支持快速光线追踪。
 
-检查法线是否已正确归一化到 [0,1]。
+---
 
-性能优化：
+#### **测试场景与报告对比**
+- **测试场景**：Cornell Box 中包含玻璃球（焦散）和漫反射平面。
+- **对比指标**：
+  - **Path Tracer（无光子映射）**：高噪点，缺失焦散。
+  - **Photon Mapping（1M光子）**：平滑间接光照，清晰焦散（需截图对比）。
 
-多线程：在渲染AOV时使用并行计算。
+---
 
-缓冲区复用：避免重复生成AOV数据。
-
-3. 总结：AOV与OIDN的关系
-AOV是输入：提供场景的几何与材质信息，辅助降噪器区分噪声和真实细节。
-
-OIDN是工具：利用AOV执行降噪，生成高质量图像。
-
-代码示例（完整流程）
-cpp
-Copy
-// 生成AOV  
-renderScene(framebuffer);  
-
-// 配置OIDN  
-oidn::DeviceRef device = oidn::newDevice();  
-device.commit();  
-oidn::FilterRef filter = device.newFilter("RT");  
-filter.setImage("color",  framebuffer.color.data(),  oidn::Format::Float3, width, height);  
-filter.setImage("albedo", framebuffer.albedo.data(), oidn::Format::Float3, width, height);  
-filter.setImage("normal", framebuffer.normal.data(), oidn::Format::Float3, width, height);  
-filter.setImage("output", outputBuffer, oidn::Format::Float3, width, height);  
-filter.set("hdr", true);  
-filter.commit();  
-
-// 执行降噪  
-filter.execute();  
-
-// 检查错误并保存结果  
-if (device.getError(errorMessage)) { /* 处理错误 */ }  
-saveEXR("denoised.exr", outputBuffer, width, height);  
-通过以上步骤，你可以正确集成OIDN并利用AOV实现高效降噪。
+**最终提交**：完整代码（含注释）、可执行文件、测试场景截图及对比分析报告。

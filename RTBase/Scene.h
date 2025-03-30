@@ -197,11 +197,15 @@ public:
 	}
 	bool visible(const Vec3& p1, const Vec3& p2)
 	{
-		Ray ray;
 		Vec3 dir = p2 - p1;
 		float maxT = dir.length() - (2.0f * RAY_EPSILON);
 		dir = dir.normalize();
-		ray.init(p1 + (dir * RAY_EPSILON), dir);
+		
+		// 使用更可靠的偏移方式（这里我们没有法线信息，仍使用方向偏移）
+		// 但使用更大的偏移量以减少自相交问题
+		const float safeEpsilon = RAY_EPSILON * 2.0f;
+		Ray ray(p1 + (dir * safeEpsilon), dir);
+		
 		return bvh->traverseVisible(ray, triangles, maxT);
 	}
 	Colour emit(Triangle* light, ShadingData shadingData, Vec3 wi)

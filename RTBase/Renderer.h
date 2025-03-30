@@ -153,6 +153,20 @@ public:
 	}
 };
 
+// VPL (虚拟点光源) 数据结构
+class VPL {
+public:
+	Vec3 position;      // VPL位置 (x_i)
+	Vec3 normal;        // 表面法线 (n_i)
+	ShadingData shadingData; // 包含BSDF (f_r)
+	Colour Le;          // VPL辐射度 (L_e(i))
+	
+	VPL() {}
+	
+	VPL(Vec3 _position, Vec3 _normal, ShadingData _shadingData, Colour _Le) :
+		position(_position), normal(_normal), shadingData(_shadingData), Le(_Le) {}
+};
+
 class RayTracer
 {
 public:
@@ -183,6 +197,14 @@ public:
 	// 添加降噪相关变量
 	bool enableDenoising = false; // 是否启用降噪
 	bool collectAOVs = false;    // 是否收集AOV（仅在启用降噪时有效）
+	
+	// Instant Radiosity相关变量
+	std::vector<VPL> vpls;       // VPL集合
+	int numVPLs = 500;          // 默认VPL数量
+	bool enableIR = false;      // 是否启用Instant Radiosity
+	float vplClampThreshold = 0.1f; // VPL强度截断阈值，用于避免奇异性
+	float RR_PROB = 0.8f;       // 俄罗斯轮盘赌概率
+	std::mutex vplMutex;        // 保护VPL集合的互斥锁
 	
 	// 設置渲染模式
 	void setRenderMode(int mode) {
@@ -243,6 +265,11 @@ public:
 			int originalSPP = SPP;
 			SPP = (SPP * 3) / 4; // 减少25%的样本数
 			std::cout << "简单场景自动优化: SPP从" << originalSPP << "减少到" << SPP << std::endl;
+		}
+		
+		// 3. 如果启用了IR，生成VPL
+		if (enableIR) {
+			traceVPLs();
 		}
 	}
 	
@@ -347,9 +374,9 @@ public:
 			return L;
 		}
 		
-		// 创建射线
-		Ray bsdfRay;
-		bsdfRay.init(shadingData.x + bsdfDirection * RAY_EPSILON, bsdfDirection);
+		// 创建射线 - 使用表面法线方向偏移
+		Vec3 offsetOrigin = shadingData.x + shadingData.sNormal * RAY_EPSILON;
+		Ray bsdfRay(offsetOrigin, bsdfDirection);
 		
 		// 检查是否击中光源
 		IntersectionData hitInfo = scene->traverse(bsdfRay);
@@ -418,6 +445,72 @@ public:
 		return L;
 	}
 	
+	// 计算VPL贡献的间接光照
+	Colour computeIndirectVPL(ShadingData& shadingData)
+	{
+		// 如果没有启用Instant Radiosity或没有VPL，返回黑色
+		if (!enableIR || vpls.empty()) {
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 纯镜面材质不计算VPL贡献（这些将通过路径追踪处理）
+		if (shadingData.bsdf->isPureSpecular()) {
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 用于累积间接光照的变量
+		Colour indirect(0.0f, 0.0f, 0.0f);
+		
+		// 遍历并计算所有VPL的贡献
+		for (const VPL& vpl : vpls) {
+			// 计算从着色点到VPL的方向
+			Vec3 vplDirection = vpl.position - shadingData.x;
+			float distance = vplDirection.length();
+			
+			// 当距离太近时，跳过以避免奇异性
+			if (distance < 1e-5f) {
+				continue;
+			}
+			
+			// 归一化方向
+			vplDirection = vplDirection / distance;
+			
+			// 检查几何项（方向与法线夹角）
+			float nDotL = Dot(shadingData.sNormal, vplDirection);
+			float vplNDotL = Dot(vpl.normal, -vplDirection);
+			
+			// 如果任一角度为负，表示VPL在背面，跳过
+			if (nDotL <= 0.0f || vplNDotL <= 0.0f) {
+				continue;
+			}
+			
+			// 计算几何项G
+			float G = nDotL * vplNDotL / (distance * distance);
+			
+			// 应用截断以避免奇异性
+			if (G > vplClampThreshold) {
+				G = vplClampThreshold;
+			}
+			
+			// 检查可见性（阴影测试）
+			// 使用表面法线方向偏移，而非射线方向
+			Vec3 offsetOrigin = shadingData.x + shadingData.sNormal * RAY_EPSILON;
+			Ray shadowRay(offsetOrigin, vplDirection);
+			
+			if (!scene->visible(shadowRay.o, vpl.position)) {
+				continue; // VPL被遮挡
+			}
+			
+			// 计算BRDF项
+			Colour brdf = shadingData.bsdf->evaluate(shadingData, vplDirection);
+			
+			// 累加贡献
+			indirect = indirect + brdf * vpl.Le * G;
+		}
+		
+		return indirect;
+	}
+	
 	Colour pathTrace(Ray& r, Colour& pathThroughput, int depth, Sampler* sampler)
 	{
 		// 路径追踪算法实现
@@ -465,9 +558,9 @@ public:
 		float cosTheta = Dot(shadingData.sNormal, wi);
 		if (cosTheta <= 0.0f) return directLight;
 		
-		// 创建新的光线
-		Ray nextRay;
-		nextRay.init(shadingData.x + wi * RAY_EPSILON, wi);
+		// 创建新的光线 - 使用表面法线方向偏移
+		Vec3 offsetOrigin = shadingData.x + shadingData.sNormal * RAY_EPSILON;
+		Ray nextRay(offsetOrigin, wi);
 		
 		// 递归获取间接光照
 		Colour bounceLight = pathTrace(nextRay, pathThroughput, depth + 1, sampler);
@@ -488,61 +581,95 @@ public:
 		return result;
 	}
 	
+	// 计算直接光照和VPL贡献的总照明
 	Colour direct(Ray& r, Sampler* sampler)
 	{
-		// 计算场景交点
-		IntersectionData intersection = scene->traverse(r);
-		if (intersection.t == FLT_MAX) 
-		{
-			// 没有相交，返回背景
-			ShadingData shadingData;
-			shadingData.wo = -r.dir;
-			return scene->background->evaluate(shadingData, r.dir);
+		// 与场景相交
+		IntersectionData hit = scene->traverse(r);
+		if (hit.t == FLT_MAX) {
+			if (scene->background != nullptr) {
+				return scene->background->evaluate(ShadingData(), r.dir);
+			}
+			return Colour(0.0f, 0.0f, 0.0f);
 		}
 		
-		// 计算着色数据
-		ShadingData shadingData = scene->calculateShadingData(intersection, r);
+		// 计算交点的着色数据
+		ShadingData shadingData = scene->calculateShadingData(hit, r);
 		
-		// 如果是光源，直接返回发光值
+		// 如果是光源，直接返回发射值
 		if (shadingData.bsdf->isLight())
 		{
-			return shadingData.bsdf->emit(shadingData, shadingData.wo);
+			return shadingData.bsdf->emit(shadingData, -r.dir);
 		}
 		
 		// 计算直接光照
 		Colour directLight = computeDirect(shadingData, sampler);
 		
-		// 添加环境光以确保场景不会完全黑暗
-		Colour ambientLight(0.15f, 0.15f, 0.15f);
-		
-		// 获取材质的漫反射颜色/albedo
-		Colour albedoColor(0.5f, 0.5f, 0.5f); // 默认灰色
-		
-		// 使用BSDF的evaluate方法在漫反射方向上评估
-		Vec3 upVector(0.0f, 1.0f, 0.0f);
-		albedoColor = shadingData.bsdf->evaluate(shadingData, upVector);
-		
-		// 确保返回颜色不为零并且不是NaN
-		Colour result = directLight + (albedoColor * ambientLight);
-		
-		if (std::isnan(result.r) || std::isnan(result.g) || std::isnan(result.b)) {
-			return Colour(0.1f, 0.1f, 0.1f); // 返回灰色而不是全黑
+		// 如果使用Instant Radiosity，添加VPL贡献的间接光照
+		if (enableIR) {
+			Colour indirectLight = computeIndirectVPL(shadingData);
+			return directLight + indirectLight;
 		}
 		
-		// 确保结果至少有最小亮度
-		if (result.r <= 0.01f && result.g <= 0.01f && result.b <= 0.01f) {
-			return albedoColor * 0.1f; // 返回暗淡的材質颜色
-		}
-		
-		// 限制極端值
-		const float maxValue = 10.0f; // 設置顏色值的上限
-		if (result.r > maxValue) result.r = maxValue;
-		if (result.g > maxValue) result.g = maxValue;
-		if (result.b > maxValue) result.b = maxValue;
-		
-		return result;
+		// 不使用IR时只返回直接光照
+		return directLight;
 	}
 	
+	// 仅渲染VPL贡献的间接光照（用于可视化和调试）
+	Colour irIndirect(Ray& r, Sampler* sampler)
+	{
+		// 与场景相交
+		IntersectionData hit = scene->traverse(r);
+		if (hit.t == FLT_MAX) {
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 计算交点的着色数据
+		ShadingData shadingData = scene->calculateShadingData(hit, r);
+		
+		// 如果是光源，返回黑色（不显示光源）
+		if (shadingData.bsdf->isLight())
+		{
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 只计算VPL贡献的间接光照
+		return computeIndirectVPL(shadingData);
+	}
+	
+	// 可视化VPL位置（用于调试）
+	Colour visualizeVPLs(Ray& r, Sampler* sampler)
+	{
+		// 与场景相交
+		IntersectionData hit = scene->traverse(r);
+		if (hit.t == FLT_MAX) {
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 计算交点的着色数据
+		ShadingData shadingData = scene->calculateShadingData(hit, r);
+		
+		// 如果是光源，直接返回发射值
+		if (shadingData.bsdf->isLight())
+		{
+			return shadingData.bsdf->emit(shadingData, -r.dir);
+		}
+		
+		// 检查是否接近任何VPL
+		const float vplRadius = 0.05f; // VPL显示半径
+		for (const VPL& vpl : vpls) {
+			float distance = (shadingData.x - vpl.position).length();
+			if (distance < vplRadius) {
+				// 在VPL位置显示亮点
+				return Colour(5.0f, 0.0f, 0.0f); // 明亮的红色表示VPL位置
+			}
+		}
+		
+		// 否则返回灰色场景
+		return Colour(0.3f, 0.3f, 0.3f);
+	}
+	
+	// 渲染物体的反照率(Albedo)
 	Colour albedo(Ray& r)
 	{
 		IntersectionData intersection = scene->traverse(r);
@@ -558,6 +685,7 @@ public:
 		return scene->background->evaluate(shadingData, r.dir);
 	}
 	
+	// 渲染表面法线图以便调试
 	Colour viewNormals(Ray& r)
 	{
 		IntersectionData intersection = scene->traverse(r);
@@ -866,6 +994,46 @@ public:
 								film->setNormal(px, py, pixelColour); // 法线已经计算
 							}
 							break;
+						case 5: // Instant Radiosity (直接光照 + VPL间接光照)
+							// 使用direct函数内部会根据enableIR自动处理VPL贡献
+							pixelColour = direct(ray, &sampler);
+							
+							// 收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
+							break;
+						case 6: // 仅VPL间接光照（用于可视化间接光照）
+							pixelColour = irIndirect(ray, &sampler);
+							
+							// 收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
+							break;
+						case 7: // 可视化VPL位置
+							pixelColour = visualizeVPLs(ray, &sampler);
+							
+							// 收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
+							break;
 						default: // 默認使用直接光照
 							pixelColour = direct(ray, &sampler);
 							
@@ -1047,6 +1215,166 @@ public:
 		}
 		catch (...) {
 			std::cerr << "Unknown exception during denoising" << std::endl;
+		}
+	}
+	
+	// 从光源生成VPL集合
+	void traceVPLs() {
+		// 清空现有VPL
+		{
+			std::lock_guard<std::mutex> lock(vplMutex);
+			vpls.clear();
+		}
+		
+		// 预分配VPL容量以提高性能
+		vpls.reserve(numVPLs);
+		
+		std::cout << "生成 " << numVPLs << " 个VPL..." << std::endl;
+		
+		MTRandom sampler(42); // 使用固定种子以获得确定性结果
+		
+		// 对每个光源采样并生成VPL
+		for (int i = 0; i < numVPLs; i++) {
+			// 随机选择一个光源
+			float pmf;
+			Light* light = scene->sampleLight(&sampler, pmf);
+			if (!light) continue;
+			
+			// 在光源上采样一个点和方向
+			float pdfPosition, pdfDirection;
+			Vec3 lightPos = light->samplePositionFromLight(&sampler, pdfPosition);
+			Vec3 lightDir = light->sampleDirectionFromLight(&sampler, pdfDirection);
+			
+			// 计算初始光能量
+			Colour Le;
+			if (light->isArea()) {
+				// 第1步：获取光源处的法线
+				Vec3 lightNormal = light->normal(ShadingData(lightPos, Vec3(0,0,1)), lightDir);
+				
+				// 第2步：创建包含正确位置和法线的ShadingData
+				ShadingData lightShadingData(lightPos, lightNormal);
+				lightShadingData.wo = -lightDir; // 设置出射方向
+				
+				// 第3步：计算方向与法线的余弦项
+				float cosTheta = Dot(lightDir, lightNormal);
+				
+				// 第4步：根据课件公式计算光源辐射度
+				if (cosTheta > 0.0f) {
+					// 方向与法线同向，光源可见
+					Le = light->evaluate(lightShadingData, -lightDir) * cosTheta;
+				} else {
+					// 方向与法线反向，光源不可见
+					Le = Colour(0.0f, 0.0f, 0.0f);
+				}
+			} else {
+				// 对于点光源或方向光源不需要考虑法线
+				ShadingData lightShadingData(lightPos, Vec3(0,0,1));
+				lightShadingData.wo = -lightDir;
+				Le = light->evaluate(lightShadingData, -lightDir);
+			}
+			
+			// 归一化光能量（考虑PDF和光源选择概率）
+			if (pdfPosition > 0.0f && pdfDirection > 0.0f && pmf > 0.0f) {
+				Le = Le / (pmf * pdfPosition * pdfDirection * numVPLs);
+			} else {
+				continue; // 跳过无效采样
+			}
+			
+			// 创建光线并追踪VPL路径 - 使用光源法线方向偏移
+			Vec3 lightNormal = light->normal(ShadingData(lightPos, Vec3(0,0,1)), lightDir);
+			Vec3 offsetOrigin = lightPos + lightNormal * RAY_EPSILON;
+			Ray ray(offsetOrigin, lightDir);
+			
+			// 追踪VPL路径，从深度0开始
+			VPLTracePath(ray, Colour(1.0f, 1.0f, 1.0f), Le, &sampler, 0);
+		}
+		
+		std::cout << "成功生成 " << vpls.size() << " 个VPL" << std::endl;
+	}
+	
+	// 递归追踪VPL路径并存储VPL - 使用参数传递递归深度
+	void VPLTracePath(Ray& ray, Colour pathThroughput, Colour Le, Sampler* sampler, int depth = 0) {
+		// 最大递归深度检查
+		static const int MAX_VPL_DEPTH = 5;
+		
+		// 递归深度检查
+		if (depth > MAX_VPL_DEPTH) {
+			return;
+		}
+		
+		// 与场景相交
+		IntersectionData hit = scene->traverse(ray);
+		if (hit.t == FLT_MAX) {
+			return; // 未命中任何物体
+		}
+		
+		// 计算交点的着色数据
+		ShadingData shadingData = scene->calculateShadingData(hit, ray);
+		
+		// 检查是否是镜面材质
+		bool isSpecular = shadingData.bsdf->isPureSpecular();
+		
+		// 如果不是镜面材质，创建并存储VPL
+		if (!isSpecular) {
+			VPL vpl(shadingData.x, shadingData.sNormal, shadingData, pathThroughput * Le);
+			
+			// 安全地添加到VPL集合中
+			{
+				std::lock_guard<std::mutex> lock(vplMutex);
+				vpls.push_back(vpl);
+			}
+		}
+		
+		// 俄罗斯轮盘赌路径终止
+		if (sampler->next() > RR_PROB) {
+			return;
+		}
+		
+		// 从着色点采样新方向
+		Colour indirect;
+		float pdf;
+		Vec3 direction = shadingData.bsdf->sample(shadingData, sampler, indirect, pdf);
+		
+		// 检查采样有效性
+		if (pdf <= 0.0f || (indirect.r <= 0.0f && indirect.g <= 0.0f && indirect.b <= 0.0f)) {
+			return;
+		}
+		
+		// 计算新的吞吐量
+		float cosTheta = Dot(direction, shadingData.sNormal);
+		Colour newThroughput = pathThroughput * indirect * (cosTheta > 0.0f ? cosTheta : 0.0f) / (pdf * RR_PROB);
+		
+		// 检查吞吐量是否接近零
+		if (newThroughput.Lum() < 0.001f) {
+			return;
+		}
+		
+		// 创建新光线并继续追踪 - 使用表面法线方向偏移
+		Vec3 offsetOrigin = shadingData.x + shadingData.sNormal * RAY_EPSILON;
+		Ray newRay(offsetOrigin, direction);
+		
+		// 递归追踪，深度加1
+		VPLTracePath(newRay, newThroughput, Le, sampler, depth + 1);
+	}
+	
+	// 启用/禁用Instant Radiosity
+	void setEnableIR(bool enable) {
+		enableIR = enable;
+		
+		// 如果启用IR，生成VPL
+		if (enable && scene) {
+			traceVPLs();
+		}
+	}
+	
+	// 设置VPL数量
+	void setNumVPLs(int num) {
+		if (num > 0) {
+			numVPLs = num;
+			// 如果已启用IR，更新VPL
+			if (enableIR && scene) {
+				traceVPLs();
+			}
 		}
 	}
 	
