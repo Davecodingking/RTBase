@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <iomanip>
 #include <algorithm> // 添加algorithm头文件，提供std::max等函数
+#include <Windows.h>
 
 // 定義在Geometry.h中聲明的外部變量
 int USE_MAX_TRIANGLES = MAXNODE_TRIANGLES;
@@ -52,8 +53,47 @@ std::string getRenderModeName(int mode) {
 	}
 }
 
+// 显示降噪后图像的函数
+void displayDenoisedImage(RayTracer& rt, GamesEngineeringBase::Window& canvas) {
+	canvas.clear();
+	// 更新画面
+	for (unsigned int y = 0; y < rt.film->height; y++) {
+		for (unsigned int x = 0; x < rt.film->width; x++) {
+			unsigned char r, g, b;
+			
+			// 使用降噪后的图像计算颜色 - 不需要除以SPP，已经是归一化的
+			Colour c = rt.film->denoisedBuffer[y * rt.film->width + x];
+			
+			// 应用色调映射和伽马校正
+			c.r = c.r < 0.0f ? 0.0f : (c.r > 1.0f ? 1.0f : c.r);
+			c.g = c.g < 0.0f ? 0.0f : (c.g > 1.0f ? 1.0f : c.g);
+			c.b = c.b < 0.0f ? 0.0f : (c.b > 1.0f ? 1.0f : c.b);
+			
+			r = (unsigned char)(pow(c.r, 1.0f / 2.2f) * 255.0f);
+			g = (unsigned char)(pow(c.g, 1.0f / 2.2f) * 255.0f);
+			b = (unsigned char)(pow(c.b, 1.0f / 2.2f) * 255.0f);
+			
+			canvas.draw(x, y, r, g, b);
+		}
+	}
+	canvas.present();
+}
+
 int main(int argc, char *argv[])
 {
+	// 确保输出目录存在
+	std::string outputDir = "RenderOutput/";
+	// 使用Windows API创建目录
+	if (!CreateDirectoryA("RenderOutput", NULL)) {
+		DWORD error = GetLastError();
+		if (error != ERROR_ALREADY_EXISTS) {
+			std::cerr << "Failed to create output directory, error code: " << error << std::endl;
+			// 继续执行，文件会保存在当前目录
+		}
+	} else {
+		std::cout << "Created output directory: RenderOutput" << std::endl;
+	}
+
 	// Add call to tests if required
 	// runTests()
 	
@@ -68,10 +108,12 @@ int main(int argc, char *argv[])
 	int maxPathDepth = 4;                  // 路徑追蹤最大反射深度
 	bool useMultithread = true;             // 是否啟用多線程渲染
 	bool useAdaptiveSampling = true;        // 是否啟用自適應採樣
-	int tileSize = 16;                      // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
+	int tileSize = 32;                      // 渲染塊大小（較小的塊可以更頻繁地更新畫面）
 	float varianceThreshold = 0.001f;        // 自適應採樣閾值 - 較低的值提供更準確的結果但需要更多樣本
 	bool enableMIS = false;                  // 是否啟用多重重要性采樣
 	bool enableEnvImportanceSampling = true; // 是否啟用環境光重要性采樣
+	bool enableDenoising = true;            // 是否启用OIDN降噪
+	bool saveAOVs = true;                   // 是否保存AOV（法线、反照率）文件
 	
 	//-------------- 線程設置 --------------
 	int threadCount = 0;                    // 渲染線程數 (0=自動使用系統核心數-1)
@@ -169,6 +211,14 @@ int main(int argc, char *argv[])
 			{
 				enableEnvImportanceSampling = (pair.second == "true");
 			}
+			if (pair.first == "-enableDenoising")
+			{
+				enableDenoising = (pair.second == "true");
+			}
+			if (pair.first == "-saveAOVs")
+			{
+				saveAOVs = (pair.second == "true");
+			}
 		}
 	}
 	Scene* scene = loadScene(sceneName);
@@ -212,6 +262,7 @@ int main(int argc, char *argv[])
 	rt.varianceThreshold = varianceThreshold; // 設置自適應採樣閾值
 	rt.setEnableMIS(enableMIS);
 	rt.setEnableImportanceSamplingEnv(enableEnvImportanceSampling);
+	rt.setEnableDenoising(enableDenoising); // 设置是否启用降噪
 	
 	// 應用線程數設置
 	if (threadCount > 0) {
@@ -276,6 +327,8 @@ int main(int argc, char *argv[])
 	std::cout << " - Target SPP: " << rt.SPP << std::endl;
 	std::cout << " - Enable MIS: " << (rt.isEnableMIS() ? "Enabled" : "Disabled") << std::endl;
 	std::cout << " - Enable Environment Importance Sampling: " << (rt.isEnableImportanceSamplingEnv() ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Enable Denoising: " << (enableDenoising ? "Enabled" : "Disabled") << std::endl;
+	std::cout << " - Save AOVs: " << (saveAOVs ? "Enabled" : "Disabled") << std::endl;
 	std::cout << std::endl;
 	
 	bool running = true;
@@ -298,12 +351,39 @@ int main(int argc, char *argv[])
 				// 只在第一次達到目標時保存結果
 				std::cout << "Rendering completed with " << rt.film->SPP << " samples." << std::endl;
 				// 保存结果
-				rt.saveHDR(filename);
-				std::cout << "Image saved to " << filename << std::endl;
+				std::string fullFilename = outputDir + filename;
+				rt.saveHDR(fullFilename);
+				std::cout << "Image saved to " << fullFilename << std::endl;
 				
-				std::string pngFilename = filename.substr(0, filename.find_last_of('.')) + ".png";
+				std::string baseFilename = filename.substr(0, filename.find_last_of('.'));
+				std::string pngFilename = outputDir + baseFilename + ".png";
 				rt.savePNG(pngFilename);
 				std::cout << "PNG image saved to " << pngFilename << std::endl;
+				
+				// 如果启用了降噪，执行降噪
+				if (enableDenoising) {
+					rt.denoise();
+					
+					// 显示降噪后的图像
+					if (rt.film->hasAOVs) {
+						displayDenoisedImage(rt, canvas);
+						
+						// 保存降噪后的图像
+						std::string denoisedHDRFilename = outputDir + baseFilename + "_denoised.hdr";
+						stbi_write_hdr(denoisedHDRFilename.c_str(), rt.film->width, rt.film->height, 3, (float*)rt.film->denoisedBuffer);
+						std::cout << "Denoised HDR image saved to " << denoisedHDRFilename << std::endl;
+						
+						std::string denoisedPNGFilename = outputDir + baseFilename + "_denoised.png";
+						rt.film->saveTonemappedPNG(denoisedPNGFilename, 1.0f, rt.film->denoisedBuffer);
+						std::cout << "Denoised PNG image saved to " << denoisedPNGFilename << std::endl;
+					}
+				}
+				
+				// 如果需要保存AOV，保存AOV图像
+				if (saveAOVs) {
+					rt.saveAOVs(outputDir + baseFilename);
+					std::cout << "AOV images saved with prefix " << outputDir + baseFilename << std::endl;
+				}
 				
 				frames = 1; // 標記為已完成渲染
 			}
@@ -326,12 +406,39 @@ int main(int argc, char *argv[])
 			// 如果已達到目標樣本數，保存最終結果
 			if (rt.film->SPP >= rt.SPP) {
 				// 保存结果
-				rt.saveHDR(filename);
-				std::cout << "Image saved to " << filename << std::endl;
+				std::string fullFilename = outputDir + filename;
+				rt.saveHDR(fullFilename);
+				std::cout << "Image saved to " << fullFilename << std::endl;
 				
-				std::string pngFilename = filename.substr(0, filename.find_last_of('.')) + ".png";
+				std::string baseFilename = filename.substr(0, filename.find_last_of('.'));
+				std::string pngFilename = outputDir + baseFilename + ".png";
 				rt.savePNG(pngFilename);
 				std::cout << "PNG image saved to " << pngFilename << std::endl;
+				
+				// 如果启用了降噪，执行降噪
+				if (enableDenoising) {
+					rt.denoise();
+					
+					// 显示降噪后的图像
+					if (rt.film->hasAOVs) {
+						displayDenoisedImage(rt, canvas);
+						
+						// 保存降噪后的图像
+						std::string denoisedHDRFilename = outputDir + baseFilename + "_denoised.hdr";
+						stbi_write_hdr(denoisedHDRFilename.c_str(), rt.film->width, rt.film->height, 3, (float*)rt.film->denoisedBuffer);
+						std::cout << "Denoised HDR image saved to " << denoisedHDRFilename << std::endl;
+						
+						std::string denoisedPNGFilename = outputDir + baseFilename + "_denoised.png";
+						rt.film->saveTonemappedPNG(denoisedPNGFilename, 1.0f, rt.film->denoisedBuffer);
+						std::cout << "Denoised PNG image saved to " << denoisedPNGFilename << std::endl;
+					}
+				}
+				
+				// 如果需要保存AOV，保存AOV图像
+				if (saveAOVs) {
+					rt.saveAOVs(outputDir + baseFilename);
+					std::cout << "AOV images saved with prefix " << outputDir + baseFilename << std::endl;
+				}
 			}
 		}
 		

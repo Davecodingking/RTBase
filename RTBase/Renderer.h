@@ -1,5 +1,10 @@
 #pragma once
 
+// 以下两种包含方式，编译器会选择能找到的那一个
+// 实际编译时不会有问题，只是IDE可能会显示错误
+#include "../oidn-2.3.2.x64.windows/include/OpenImageDenoise/oidn.hpp"
+//#include <OpenImageDenoise/oidn.hpp>
+
 #include "Core.h"
 #include "Sampling.h"
 #include "Geometry.h"
@@ -174,6 +179,10 @@ public:
 	bool adaptiveSampling = true; // 是否啟用自適應採樣
 	bool multithreaded = true;   // 是否啟用多線程渲染
 	float varianceThreshold = 0.05f; // 自適應採樣閾值
+	
+	// 添加降噪相关变量
+	bool enableDenoising = false; // 是否启用降噪
+	bool collectAOVs = false;    // 是否收集AOV（仅在启用降噪时有效）
 	
 	// 設置渲染模式
 	void setRenderMode(int mode) {
@@ -804,19 +813,71 @@ public:
 						{
 							Colour pathThroughput(1.0f, 1.0f, 1.0f);
 							pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								// 获取反照率
+								Colour albedoColour = albedo(ray);
+								
+								// 获取法线
+								Colour normalColour = viewNormals(ray);
+								
+								// 添加到film中的AOV缓冲区
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
 						}
 						break;
 						case 2: // 直接光照
 							pixelColour = direct(ray, &sampler);
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
 							break;
 						case 3: // Albedo
 							pixelColour = albedo(ray);
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集法线
+							if (collectAOVs && currentSpp == 1) {
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, pixelColour); // 反照率已经计算
+								film->setNormal(px, py, normalColour);
+							}
 							break;
 						case 4: // 法線視圖
 							pixelColour = viewNormals(ray);
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集反照率
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, pixelColour); // 法线已经计算
+							}
 							break;
 						default: // 默認使用直接光照
 							pixelColour = direct(ray, &sampler);
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							}
 					}
 					
 					// 確保顏色值有效
@@ -881,7 +942,112 @@ public:
 	
 	void savePNG(std::string filename)
 	{
-		film->saveTonemappedPNG(filename, 1.0f);
+		film->saveTonemappedPNG(filename);
+	}
+	
+	// 添加保存AOV的方法
+	void saveAOVs(std::string prefix)
+	{
+		film->saveAOV(prefix);
+	}
+	
+	// 设置是否启用降噪
+	void setEnableDenoising(bool enable) {
+		enableDenoising = enable;
+		// 如果启用降噪，则自动收集AOV
+		if (enable) {
+			collectAOVs = true;
+		}
+	}
+	
+	// 设置是否收集AOV
+	void setCollectAOVs(bool collect) {
+		collectAOVs = collect;
+	}
+	
+	// 使用OIDN执行降噪
+	void denoise() {
+		if (!enableDenoising) {
+			std::cout << "Unable to denoise: Denoising is not enabled." << std::endl;
+			return;
+		}
+		
+		if (!film->hasAOVs) {
+			std::cout << "Unable to denoise: No AOV data collected. Make sure collectAOVs is set to true." << std::endl;
+			return;
+		}
+		
+		std::cout << "Starting denoising process..." << std::endl;
+		auto startTime = std::chrono::high_resolution_clock::now();
+		
+		try {
+			// 创建OIDN设备
+			oidn::DeviceRef device = oidn::newDevice();
+			device.commit();
+			
+			// 创建降噪过滤器（选择"RT"模式，适用于路径追踪）
+			oidn::FilterRef filter = device.newFilter("RT");
+			
+			// 准备输入数据 - 确保用正确的SPP值归一化
+			Colour* normalizedColor = new Colour[film->width * film->height];
+			for (unsigned int i = 0; i < film->width * film->height; i++) {
+				normalizedColor[i] = film->film[i] / (float)film->SPP;
+			}
+			
+			// 确保denoisedBuffer已初始化
+			if (!film->denoisedBuffer) {
+				film->denoisedBuffer = new Colour[film->width * film->height];
+			}
+			
+			// 设置输入输出缓冲区
+			filter.setImage("color", (float*)normalizedColor, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("albedo", (float*)film->albedoBuffer, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("normal", (float*)film->normalBuffer, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("output", (float*)film->denoisedBuffer, oidn::Format::Float3, film->width, film->height);
+			
+			// 启用HDR模式
+			filter.set("hdr", true);
+			
+			// 提交配置并执行降噪
+			filter.commit();
+			filter.execute();
+			
+			// 检查错误 - 修复错误处理方式
+			const char* errorMessage = nullptr;
+			if (device.getError(errorMessage) != oidn::Error::None && errorMessage != nullptr) {
+				std::cerr << "OIDN denoising error: " << errorMessage << std::endl;
+				delete[] normalizedColor;
+				return;
+			}
+			
+			// 调试信息：检查输出是否有效
+			float maxValue = 0.0f;
+			float minValue = 1.0f;
+			for (unsigned int i = 0; i < film->width * film->height; i++) {
+				// 使用三目运算符替代std::max和std::min
+				maxValue = (film->denoisedBuffer[i].r > maxValue) ? film->denoisedBuffer[i].r : maxValue;
+				maxValue = (film->denoisedBuffer[i].g > maxValue) ? film->denoisedBuffer[i].g : maxValue;
+				maxValue = (film->denoisedBuffer[i].b > maxValue) ? film->denoisedBuffer[i].b : maxValue;
+				
+				minValue = (film->denoisedBuffer[i].r < minValue) ? film->denoisedBuffer[i].r : minValue;
+				minValue = (film->denoisedBuffer[i].g < minValue) ? film->denoisedBuffer[i].g : minValue;
+				minValue = (film->denoisedBuffer[i].b < minValue) ? film->denoisedBuffer[i].b : minValue;
+			}
+			std::cout << "Denoised result range: [" << minValue << ", " << maxValue << "]" << std::endl;
+			
+			// 释放临时内存
+			delete[] normalizedColor;
+			
+			auto endTime = std::chrono::high_resolution_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count() / 1000.0f;
+			std::cout << "Denoising completed in " << duration << " seconds" << std::endl;
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Exception during denoising: " << e.what() << std::endl;
+		}
+		catch (...) {
+			std::cerr << "Unknown exception during denoising" << std::endl;
+		}
 	}
 	
 	// 设置控制参数的方法

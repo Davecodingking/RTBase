@@ -201,6 +201,13 @@ public:
 	unsigned int height;
 	int SPP;
 	ImageFilter* filter;
+
+	// 添加AOV缓冲区
+	Colour* albedoBuffer;  // 反照率
+	Colour* normalBuffer;  // 法线
+	Colour* denoisedBuffer; // 降噪后的结果
+	bool hasAOVs;         // 是否生成AOV
+
 	void splat(const float x, const float y, const Colour& L)
 	{
 		float filterWeights[25]; // Storage to cache weights
@@ -253,14 +260,27 @@ public:
 	{
 		width = _width;
 		height = _height;
-		film = new Colour[width * height];
-		clear();
 		filter = _filter;
+		film = new Colour[width * height];
+		SPP = 0;
+
+		// 初始化AOV缓冲区
+		albedoBuffer = new Colour[width * height];
+		normalBuffer = new Colour[width * height];
+		denoisedBuffer = new Colour[width * height];
+		hasAOVs = false;
+
+		clear();
 	}
 	void clear()
 	{
-		memset(film, 0, width * height * sizeof(Colour));
 		SPP = 0;
+		memset(film, 0, width * height * sizeof(Colour));
+		// 清空AOV缓冲区
+		memset(albedoBuffer, 0, width * height * sizeof(Colour));
+		memset(normalBuffer, 0, width * height * sizeof(Colour));
+		memset(denoisedBuffer, 0, width * height * sizeof(Colour));
+		hasAOVs = false;
 	}
 	void incrementSPP()
 	{
@@ -277,22 +297,110 @@ public:
 		delete[] hdrpixels;
 	}
 	
-	void saveTonemappedPNG(std::string filename, float exposure = 1.0f)
+	void saveTonemappedPNG(std::string filename, float exposure = 1.0f, Colour* buffer = nullptr)
 	{
-		unsigned char* ldrPixels = new unsigned char[width * height * 3];
+		if (buffer == nullptr) buffer = film;
+		
+		unsigned char* image = new unsigned char[width * height * 3];
 		for (unsigned int y = 0; y < height; y++)
 		{
 			for (unsigned int x = 0; x < width; x++)
 			{
 				unsigned char r, g, b;
-				tonemap(x, y, r, g, b, exposure);
-				int idx = (y * width + x) * 3;
-				ldrPixels[idx] = r;
-				ldrPixels[idx + 1] = g;
-				ldrPixels[idx + 2] = b;
+				unsigned int index = (y * width) + x;
+				
+				// 应用色调映射
+				// 如果是主缓冲区(film)，需要除以SPP归一化
+				float v = exposure;
+				Colour c;
+				if (buffer == film) {
+					// 原始渲染结果需要除以SPP
+					c = buffer[index] * v / (float)SPP;
+				} else {
+					// 降噪后的结果已经是归一化的，不需要再除以SPP
+					c = buffer[index] * v;
+				}
+				
+				// 确保值在合理范围内
+				c.r = c.r < 0.0f ? 0.0f : (c.r > 1.0f ? 1.0f : c.r);
+				c.g = c.g < 0.0f ? 0.0f : (c.g > 1.0f ? 1.0f : c.g);
+				c.b = c.b < 0.0f ? 0.0f : (c.b > 1.0f ? 1.0f : c.b);
+				
+				// 应用伽马校正
+				r = (unsigned char)(pow(c.r, 1.0f / 2.2f) * 255.0f);
+				g = (unsigned char)(pow(c.g, 1.0f / 2.2f) * 255.0f);
+				b = (unsigned char)(pow(c.b, 1.0f / 2.2f) * 255.0f);
+				
+				image[(y * width + x) * 3 + 0] = r;
+				image[(y * width + x) * 3 + 1] = g;
+				image[(y * width + x) * 3 + 2] = b;
 			}
 		}
-		stbi_write_png(filename.c_str(), width, height, 3, ldrPixels, width * 3);
-		delete[] ldrPixels;
+		stbi_write_png(filename.c_str(), width, height, 3, image, width * 3);
+		delete[] image;
+	}
+
+	// 保存AOV缓冲区为HDR文件
+	void saveAOV(std::string prefix)
+	{
+		if (!hasAOVs) return;
+		
+		// 保存反照率
+		std::string albedoFilename = prefix + "_albedo.hdr";
+		stbi_write_hdr(albedoFilename.c_str(), width, height, 3, (float*)albedoBuffer);
+		
+		// 保存法线
+		std::string normalFilename = prefix + "_normal.hdr";
+		stbi_write_hdr(normalFilename.c_str(), width, height, 3, (float*)normalBuffer);
+		
+		// 如果有降噪后的结果，也保存它
+		if (hasAOVs && denoisedBuffer != nullptr) {
+			// 检查denoisedBuffer是否包含非零数据
+			bool hasDenoised = false;
+			for (unsigned int i = 0; i < width * height; ++i) {
+				if (denoisedBuffer[i].r != 0.0f || denoisedBuffer[i].g != 0.0f || denoisedBuffer[i].b != 0.0f) {
+					hasDenoised = true;
+					break;
+				}
+			}
+			
+			if (hasDenoised) {
+				std::string denoisedFilename = prefix + "_denoised.hdr";
+				stbi_write_hdr(denoisedFilename.c_str(), width, height, 3, (float*)denoisedBuffer);
+				
+				// 保存降噪后的PNG
+				saveTonemappedPNG(prefix + "_denoised.png", 1.0f, denoisedBuffer);
+			}
+		}
+	}
+
+	// 设置反照率AOV
+	void setAlbedo(const float x, const float y, const Colour& albedo)
+	{
+		if (x < 0 || x >= width || y < 0 || y >= height) return;
+		int px = (int)x;
+		int py = (int)y;
+		albedoBuffer[py * width + px] = albedo;
+		hasAOVs = true;
+	}
+
+	// 设置法线AOV（需要将法线从[-1,1]映射到[0,1]范围）
+	void setNormal(const float x, const float y, const Colour& normal)
+	{
+		if (x < 0 || x >= width || y < 0 || y >= height) return;
+		int px = (int)x;
+		int py = (int)y;
+		// 将法线从[-1,1]映射到[0,1]范围
+		Colour mappedNormal = (normal + Colour(1.0f, 1.0f, 1.0f)) * 0.5f;
+		normalBuffer[py * width + px] = mappedNormal;
+		hasAOVs = true;
+	}
+
+	~Film()
+	{
+		delete[] film;
+		delete[] albedoBuffer;
+		delete[] normalBuffer;
+		delete[] denoisedBuffer;
 	}
 };

@@ -33,3 +33,146 @@ OR
 OR
 -	Primary Sample Space Metropolis Light Transport (50 Marks)
 o	You can integrate with the path tracer, or any other algorithm if this is implemented
+
+
+步骤1：在渲染器中生成AOV
+在着色阶段输出AOV：
+修改着色器代码，为每个像素额外输出法线、反照率、深度等信息。
+
+cpp
+Copy
+// 伪代码示例：在着色器中生成AOV  
+struct ShadingData {  
+    vec3 color;     // 原始颜色（含噪声）  
+    vec3 albedo;    // 材质反照率（无光照）  
+    vec3 normal;    // 表面法线（世界空间）  
+    float depth;    // 深度值（相机空间）  
+};  
+
+// 在渲染循环中存储AOV到独立缓冲区  
+framebuffer.color[pixel] = shadingData.color;  
+framebuffer.albedo[pixel] = shadingData.albedo;  
+framebuffer.normal[pixel] = (shadingData.normal + 1.0) / 2.0; // 法线归一化到[0,1]  
+framebuffer.depth[pixel] = shadingData.depth;  
+注意事项：
+
+法线归一化：OIDN要求法线范围在 [0,1]，需将世界空间法线（范围 [-1,1]）映射到 [0,1]。
+
+深度标准化：根据相机参数将深度值缩放到合理范围（如 [0,1]）。
+
+步骤2：配置OIDN并绑定AOV
+初始化OIDN设备与过滤器：
+
+cpp
+Copy
+#include <OpenImageDenoise/oidn.hpp>  
+
+// 初始化OIDN设备  
+oidn::DeviceRef device = oidn::newDevice();  
+device.commit();  
+
+// 创建降噪过滤器（选择“RT”模式，适用于路径追踪）  
+oidn::FilterRef filter = device.newFilter("RT");  
+绑定AOV缓冲区：
+
+cpp
+Copy
+// 假设已生成以下缓冲区（宽度width，高度height）  
+float* colorBuffer = framebuffer.color.data();  
+float* albedoBuffer = framebuffer.albedo.data();  
+float* normalBuffer = framebuffer.normal.data();  
+float* outputBuffer = new float[width * height * 3]; // 降噪后输出  
+
+// 设置输入输出缓冲区  
+filter.setImage("color",  colorBuffer,  oidn::Format::Float3, width, height);  
+filter.setImage("albedo", albedoBuffer, oidn::Format::Float3, width, height);  
+filter.setImage("normal", normalBuffer, oidn::Format::Float3, width, height);  
+filter.setImage("output", outputBuffer, oidn::Format::Float3, width, height);  
+
+// 启用HDR（如果渲染结果为HDR）  
+filter.set("hdr", true);  
+
+// 提交配置  
+filter.commit();  
+关键参数说明：
+
+oidn::Format::Float3：表示RGB三通道浮点数数据。
+
+hdr：若渲染结果为HDR（如OpenEXR格式），需设为 true。
+
+步骤3：执行降噪并输出结果
+执行降噪：
+
+cpp
+Copy
+filter.execute();  
+
+// 检查错误  
+const char* errorMessage;  
+if (device.getError(errorMessage) {  
+    std::cerr << "OIDN Error: " << errorMessage << std::endl;  
+    exit(1);  
+}  
+保存/显示降噪图像：
+
+cpp
+Copy
+// 将outputBuffer数据转换为图像格式（如OpenCV Mat）  
+cv::Mat denoisedImage(height, width, CV_32FC3, outputBuffer);  
+cv::imwrite("denoised.exr", denoisedImage);  
+步骤4：验证与调试
+检查AOV是否正确生成：
+
+单独保存每个AOV通道并查看：
+
+cpp
+Copy
+saveImage("normal.exr", framebuffer.normal);  
+saveImage("albedo.exr", framebuffer.albedo);  
+预期结果：
+
+法线图应清晰显示物体表面朝向。
+
+反照率图应为纯材质颜色（无阴影或高光）。
+
+调试OIDN输入：
+
+确保缓冲区尺寸、格式与OIDN要求一致。
+
+检查法线是否已正确归一化到 [0,1]。
+
+性能优化：
+
+多线程：在渲染AOV时使用并行计算。
+
+缓冲区复用：避免重复生成AOV数据。
+
+3. 总结：AOV与OIDN的关系
+AOV是输入：提供场景的几何与材质信息，辅助降噪器区分噪声和真实细节。
+
+OIDN是工具：利用AOV执行降噪，生成高质量图像。
+
+代码示例（完整流程）
+cpp
+Copy
+// 生成AOV  
+renderScene(framebuffer);  
+
+// 配置OIDN  
+oidn::DeviceRef device = oidn::newDevice();  
+device.commit();  
+oidn::FilterRef filter = device.newFilter("RT");  
+filter.setImage("color",  framebuffer.color.data(),  oidn::Format::Float3, width, height);  
+filter.setImage("albedo", framebuffer.albedo.data(), oidn::Format::Float3, width, height);  
+filter.setImage("normal", framebuffer.normal.data(), oidn::Format::Float3, width, height);  
+filter.setImage("output", outputBuffer, oidn::Format::Float3, width, height);  
+filter.set("hdr", true);  
+filter.commit();  
+
+// 执行降噪  
+filter.execute();  
+
+// 检查错误并保存结果  
+if (device.getError(errorMessage)) { /* 处理错误 */ }  
+saveEXR("denoised.exr", outputBuffer, width, height);  
+通过以上步骤，你可以正确集成OIDN并利用AOV实现高效降噪。
