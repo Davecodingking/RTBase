@@ -2,8 +2,8 @@
 
 // 以下两种包含方式，编译器会选择能找到的那一个
 // 实际编译时不会有问题，只是IDE可能会显示错误
-#include "../oidn-2.3.2.x64.windows/include/OpenImageDenoise/oidn.hpp"
-//#include <OpenImageDenoise/oidn.hpp>
+//#include "../oidn-2.3.2.x64.windows/include/OpenImageDenoise/oidn.hpp"
+#include <OpenImageDenoise/oidn.hpp>
 
 #include "Core.h"
 #include "Sampling.h"
@@ -14,12 +14,13 @@
 #include "Materials.h"
 #include "Lights.h"
 #include "Scene.h"
+#include "PhotonMapping.h"  // 添加光子映射头文件
 #include "GamesEngineeringBase.h"
 #include <thread>
 #include <functional>
 #include <iostream>
 #include <vector>
-#include <algorithm>
+#include <algorithm> // 确保包含此头文件以使用std::min
 #include <mutex>
 #include <atomic>
 #include <queue>
@@ -27,6 +28,13 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <future> // 添加future头文件，用于支持异步任务
+
+// 添加自定义的min函数，避免与std::min冲突
+template<typename T>
+inline T minimum(T a, T b) {
+    return (a < b) ? a : b;
+}
 
 // Tile結構體，用於多線程渲染
 struct Tile {
@@ -167,6 +175,66 @@ public:
 		position(_position), normal(_normal), shadingData(_shadingData), Le(_Le) {}
 };
 
+// 添加线程池实现
+class ThreadPool {
+public:
+    ThreadPool(size_t numThreads) : stop(false) {
+        for(size_t i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this] {
+                while(true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queueMutex);
+                        this->condition.wait(lock, [this] { 
+                            return this->stop || !this->tasks.empty(); 
+                        });
+                        
+                        if(this->stop && this->tasks.empty()) {
+                            return;
+                        }
+                        
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+    
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            if(stop) {
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+    
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(std::thread &worker : workers) {
+            if(worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+    
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
 class RayTracer
 {
 public:
@@ -198,17 +266,33 @@ public:
 	bool enableDenoising = false; // 是否启用降噪
 	bool collectAOVs = false;    // 是否收集AOV（仅在启用降噪时有效）
 	
-	// Instant Radiosity相关变量
-	std::vector<VPL> vpls;       // VPL集合
-	int numVPLs = 500;          // 默认VPL数量
-	bool enableIR = false;      // 是否启用Instant Radiosity
-	float vplClampThreshold = 0.1f; // VPL强度截断阈值，用于避免奇异性
-	float RR_PROB = 0.8f;       // 俄罗斯轮盘赌概率
-	std::mutex vplMutex;        // 保护VPL集合的互斥锁
+	// 即时辐射度相关
+	bool enableIR = false;  // 是否启用即时辐射度算法
+	std::vector<VPL> vpls;  // 虚拟点光源
+	int numVPLs = 1000;     // VPL数量，默认1000个
+	
+	// 添加光子映射相关变量
+	PhotonMapper* photonMapper = nullptr;  // 光子映射器
+	bool enablePhotonMapping = false;      // 是否启用光子映射
+	bool enableCausticPhotons = true;      // 是否启用焦散光子
+	bool enableFinalGathering = true;      // 是否启用最终聚集
+	int numGlobalPhotons = 100000;         // 全局光子数量
+	int numCausticPhotons = 100000;        // 焦散光子数量
+	float photonRadius = 0.5f;             // 光子收集半径
+	int finalGatheringSamples = 64;        // 最终聚集的采样数量
+	
+	// 添加线程池
+	ThreadPool* threadPool = nullptr;
+	int batchSize = 4; // 每批次渲染的样本数
+	int denoiseInterval = 8; // 每渲染多少个样本执行一次降噪
 	
 	// 設置渲染模式
 	void setRenderMode(int mode) {
 		renderMode = mode;
+		// 如果设置为光子映射模式，自动启用光子映射
+		if (mode >= 6 && mode <= 8) {
+			setEnablePhotonMapping(true);
+		}
 	}
 	
 	// 獲取當前渲染模式
@@ -218,7 +302,7 @@ public:
 	
 	// 獲取當前樣本數
 	int getSPP() const {
-		return film->SPP;
+		return SPP;
 	}
 	
 	void init(Scene* _scene, GamesEngineeringBase::Window* _canvas)
@@ -226,50 +310,60 @@ public:
 		scene = _scene;
 		canvas = _canvas;
 		film = new Film();
+		// 使用init方法而不是构造函数参数
 		film->init((unsigned int)scene->camera.width, (unsigned int)scene->camera.height, new MitchellFilter());
-		SYSTEM_INFO sysInfo;
-		GetSystemInfo(&sysInfo);
-		numProcs = sysInfo.dwNumberOfProcessors;
+		
+		// 获取CPU核心数
+		SYSTEM_INFO sysinfo;
+		GetSystemInfo(&sysinfo);
+		numProcs = sysinfo.dwNumberOfProcessors - 1;
+		if (numProcs < 1) numProcs = 1;
+		
+		samplers = new MTRandom[numProcs+1];
+		for (int i = 0; i < numProcs + 1; i++) {
+			samplers[i].init(i); // 使用init而不是seed
+		}
 		threads = new std::thread*[numProcs];
-		samplers = new MTRandom[numProcs];
-		// 初始化每個線程的隨機採樣器，使用不同的種子
-		for (int i = 0; i < numProcs; ++i) {
-			samplers[i] = MTRandom(i + 1); // 使用線程ID+1作為種子
-		}
-		clear();
-		
-		// 确保canvas已初始化
-		if (canvas) {
-			canvas->clear();
+		for (int i = 0; i < numProcs; i++) {
+			threads[i] = NULL;
 		}
 		
-		// 预处理场景信息，加速渲染判断
-		preProcessScene();
+		// 创建光子映射器
+		if (photonMapper == nullptr) {
+			photonMapper = new PhotonMapper(scene, numGlobalPhotons, numCausticPhotons, photonRadius);
+		}
+		
+		// 创建线程池
+		if (threadPool == nullptr) {
+			threadPool = new ThreadPool(numProcs);
+		}
+		
+		std::cout << "Using " << numProcs << " rendering threads." << std::endl;
 	}
 	
 	// 预处理场景信息，提取关键特征以加速渲染
 	void preProcessScene() {
-		// 1. 初始化环境光重要性采样
-		if (scene && scene->background) {
-			EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
-			if (envMap) {
-				envMap->enableImportanceSampling = enableImportanceSamplingEnv;
-			}
-		}
-		
-		// 2. 如果场景复杂度低，自动减少SPP (如果还没通过其他方式减少)
-		bool isSimpleScene = (scene->lights.size() <= 1 && 
-		                      scene->background->totalIntegratedPower() < 0.1f);
-		
-		if (isSimpleScene && SPP > 32) {
-			int originalSPP = SPP;
-			SPP = (SPP * 3) / 4; // 减少25%的样本数
-			std::cout << "简单场景自动优化: SPP从" << originalSPP << "减少到" << SPP << std::endl;
-		}
-		
-		// 3. 如果启用了IR，生成VPL
+		// 如果启用了IR，生成VPLs
 		if (enableIR) {
+			std::cout << "Generating " << numVPLs << " virtual point lights (VPLs)..." << std::endl;
+			auto startTime = std::chrono::high_resolution_clock::now();
 			traceVPLs();
+			auto endTime = std::chrono::high_resolution_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count() / 1000.0f;
+			std::cout << "VPL generation complete, time: " << duration << " seconds" << std::endl;
+		}
+		
+		// 如果启用了光子映射，发射光子
+		if (enablePhotonMapping && photonMapper) {
+			std::cout << "Emitting and tracing photons..." << std::endl;
+			auto startTime = std::chrono::high_resolution_clock::now();
+			photonMapper->emitPhotons(enableCausticPhotons, true);
+			auto endTime = std::chrono::high_resolution_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count() / 1000.0f;
+			int numGlobal = 0, numCaustic = 0;
+			photonMapper->getPhotonMapStats(numGlobal, numCaustic);
+			std::cout << "Photon mapping construction complete, time: " << duration << " seconds" << std::endl;
+			std::cout << "  Global photons: " << numGlobal << ", Caustic photons: " << numCaustic << std::endl;
 		}
 	}
 	
@@ -780,6 +874,7 @@ public:
 			// 使用主線程來處理顯示更新和進度報告
 			bool isPassRendering = true;
 			int lastProgress = -1;
+			auto lastUpdateTime = std::chrono::high_resolution_clock::now();
 			
 			// 顯示更新循環
 			while (isPassRendering) {
@@ -791,8 +886,15 @@ public:
 				// 計算當前進度
 				int progress = static_cast<int>(workQueue.getProgress());
 				
-				// 進度有變化時更新進度條
-				if (progress != lastProgress) {
+				// 獲取當前時間
+				auto currentTime = std::chrono::high_resolution_clock::now();
+				auto timeSinceLastUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastUpdateTime).count();
+				
+				// 定期更新顯示 (每200毫秒) - 降低UI更新頻率，讓更多CPU資源用於渲染
+				bool shouldUpdateDisplay = timeSinceLastUpdate > 200;
+				
+				// 進度有變化或者時間達到時更新進度條
+				if ((progress != lastProgress) || shouldUpdateDisplay) {
 					// 使用單行進度條更新
 					std::cout << "\r" << "Sample " << (currentSpp + 1) << "/" << SPP << " [";
 					
@@ -807,17 +909,22 @@ public:
 					}
 					
 					// 計算經過的時間
-					auto currentTime = std::chrono::high_resolution_clock::now();
 					auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - sampleStartTime).count() / 1000.0f;
 					
 					std::cout << "] " << progress << "% (" << std::fixed << std::setprecision(1) << elapsed << "s)";
 					std::cout.flush();
 					
 					lastProgress = progress;
+					
+					// 如果應該更新顯示，則更新畫面
+					if (shouldUpdateDisplay) {
+						updateFullDisplay();
+						lastUpdateTime = currentTime;
+					}
 				}
 				
-				// 短暫休眠，減少CPU佔用
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				// 短暫休眠，減少CPU佔用 - 使用較長的休眠時間減少主線程的負擔
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
 			
 			// 等待所有線程完成
@@ -878,7 +985,7 @@ public:
 		}
 	}
 	
-	// 修改單個線程工作函數，移除大量線程日誌
+	// 修改單個線程工作函數，提高多線程性能
 	void threadWorkSinglePass(int threadId, int currentSpp) {
 		MTRandom& sampler = samplers[threadId];
 		bool hasWork = true;
@@ -912,6 +1019,9 @@ public:
 			unsigned int width = tile->endX - tile->startX;
 			unsigned int height = tile->endY - tile->startY;
 			
+			// 創建臨時顏色緩衝區，用於存儲當前tile的結果
+			std::vector<Colour> tileColourBuffer(width * height, Colour(0.0f, 0.0f, 0.0f));
+			
 			// 對tile中的每個像素進行採樣
 			for (unsigned int y = tile->startY; y < tile->endY; y++) {
 				for (unsigned int x = tile->startX; x < tile->endX; x++) {
@@ -937,7 +1047,19 @@ public:
 					// 根據渲染模式選擇合適的渲染方法
 					Colour pixelColour;
 					switch (renderMode) {
-						case 1: // 路徑追蹤
+						case 0: // 法线可视化
+							pixelColour = viewNormals(ray);
+							break;
+							
+						case 1: // 反照率
+							pixelColour = albedo(ray);
+							break;
+							
+						case 2: // 可视化VPLs
+							pixelColour = visualizeVPLs(ray, &sampler);
+							break;
+							
+						case 3: // Path Tracing
 						{
 							Colour pathThroughput(1.0f, 1.0f, 1.0f);
 							pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
@@ -950,107 +1072,156 @@ public:
 								// 获取法线
 								Colour normalColour = viewNormals(ray);
 								
-								// 添加到film中的AOV缓冲区
+								// 保存到本地缓存，稍后再一次性加锁更新
+								tileColourBuffer[index] = pixelColour;
+								
+								// 添加到film中的AOV缓冲区 - AOV仍然需要加锁，但只在第一个样本时进行
 								std::lock_guard<std::mutex> lock(filmMutex);
 								film->setAlbedo(px, py, albedoColour);
 								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
 							}
 						}
 						break;
-						case 2: // 直接光照
-							pixelColour = direct(ray, &sampler);
+						
+						case 4: // 直接光照
+							pixelColour = directOnly(ray, &sampler);
 							
 							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
 							if (collectAOVs && currentSpp == 1) {
 								Colour albedoColour = albedo(ray);
 								Colour normalColour = viewNormals(ray);
 								
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->setAlbedo(px, py, albedoColour);
-								film->setNormal(px, py, normalColour);
-							}
-							break;
-						case 3: // Albedo
-							pixelColour = albedo(ray);
-							
-							// 如果启用了AOV收集，且当前是第一个样本，收集法线
-							if (collectAOVs && currentSpp == 1) {
-								Colour normalColour = viewNormals(ray);
-								
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->setAlbedo(px, py, pixelColour); // 反照率已经计算
-								film->setNormal(px, py, normalColour);
-							}
-							break;
-						case 4: // 法線視圖
-							pixelColour = viewNormals(ray);
-							
-							// 如果启用了AOV收集，且当前是第一个样本，收集反照率
-							if (collectAOVs && currentSpp == 1) {
-								Colour albedoColour = albedo(ray);
-								
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->setAlbedo(px, py, albedoColour);
-								film->setNormal(px, py, pixelColour); // 法线已经计算
-							}
-							break;
-						case 5: // Instant Radiosity (直接光照 + VPL间接光照)
-							// 使用direct函数内部会根据enableIR自动处理VPL贡献
-							pixelColour = direct(ray, &sampler);
-							
-							// 收集AOV
-							if (collectAOVs && currentSpp == 1) {
-								Colour albedoColour = albedo(ray);
-								Colour normalColour = viewNormals(ray);
+								tileColourBuffer[index] = pixelColour;
 								
 								std::lock_guard<std::mutex> lock(filmMutex);
 								film->setAlbedo(px, py, albedoColour);
 								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
 							}
 							break;
-						case 6: // 仅VPL间接光照（用于可视化间接光照）
-							pixelColour = irIndirect(ray, &sampler);
 							
-							// 收集AOV
-							if (collectAOVs && currentSpp == 1) {
-								Colour albedoColour = albedo(ray);
-								Colour normalColour = viewNormals(ray);
-								
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->setAlbedo(px, py, albedoColour);
-								film->setNormal(px, py, normalColour);
+						case 5: // IR全局光照
+							if (enableIR) {
+								pixelColour = direct(ray, &sampler);
+							} else {
+								Colour pathThroughput(1.0f, 1.0f, 1.0f);
+								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
 							}
-							break;
-						case 7: // 可视化VPL位置
-							pixelColour = visualizeVPLs(ray, &sampler);
-							
-							// 收集AOV
-							if (collectAOVs && currentSpp == 1) {
-								Colour albedoColour = albedo(ray);
-								Colour normalColour = viewNormals(ray);
-								
-								std::lock_guard<std::mutex> lock(filmMutex);
-								film->setAlbedo(px, py, albedoColour);
-								film->setNormal(px, py, normalColour);
-							}
-							break;
-						default: // 默認使用直接光照
-							pixelColour = direct(ray, &sampler);
 							
 							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
 							if (collectAOVs && currentSpp == 1) {
 								Colour albedoColour = albedo(ray);
 								Colour normalColour = viewNormals(ray);
 								
+								tileColourBuffer[index] = pixelColour;
+								
 								std::lock_guard<std::mutex> lock(filmMutex);
 								film->setAlbedo(px, py, albedoColour);
 								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
 							}
+							break;
+							
+						case 6: // 光子映射
+							if (enablePhotonMapping && photonMapper) {
+								pixelColour = photonMappingPathTrace(ray, &sampler);
+							} else {
+								Colour pathThroughput(1.0f, 1.0f, 1.0f);
+								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+							}
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								tileColourBuffer[index] = pixelColour;
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
+							}
+							break;
+							
+						case 7: // 焦散光子映射
+							if (enablePhotonMapping && photonMapper) {
+								pixelColour = causticPhotonMapping(ray, &sampler);
+							} else {
+								Colour pathThroughput(1.0f, 1.0f, 1.0f);
+								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+							}
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								tileColourBuffer[index] = pixelColour;
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
+							}
+							break;
+							
+						case 8: // 最终聚集光子映射
+							if (enablePhotonMapping && photonMapper) {
+								
+								enableFinalGathering = true;
+								pixelColour = photonMappingPathTrace(ray, &sampler);
+							} else {
+								Colour pathThroughput(1.0f, 1.0f, 1.0f);
+								pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+							}
+							
+							// 如果启用了AOV收集，且当前是第一个样本，收集AOV
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								tileColourBuffer[index] = pixelColour;
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
+							}
+							break;
+							
+						default: // 默认使用路径追踪
+						{
+							Colour pathThroughput(1.0f, 1.0f, 1.0f);
+							pixelColour = pathTrace(ray, pathThroughput, 0, &sampler);
+							
+							if (collectAOVs && currentSpp == 1) {
+								Colour albedoColour = albedo(ray);
+								Colour normalColour = viewNormals(ray);
+								
+								tileColourBuffer[index] = pixelColour;
+								
+								std::lock_guard<std::mutex> lock(filmMutex);
+								film->setAlbedo(px, py, albedoColour);
+								film->setNormal(px, py, normalColour);
+							} else {
+								tileColourBuffer[index] = pixelColour;
+							}
+						}
+						break;
 					}
 					
-					// 確保顏色值有效
+					// 處理NaN值
 					if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
 						pixelColour = Colour(0.0f, 0.0f, 0.0f);
+						tileColourBuffer[index] = pixelColour;
 					}
 					
 					// 更新tile緩衝區
@@ -1066,11 +1237,25 @@ public:
 					if (pixelColour.r > maxValue) pixelColour.r = maxValue;
 					if (pixelColour.g > maxValue) pixelColour.g = maxValue;
 					if (pixelColour.b > maxValue) pixelColour.b = maxValue;
-					
-					// 更新film，但不直接更新畫面（避免線程衝突）
-					{
-						std::lock_guard<std::mutex> lock(filmMutex);
-						film->splat(px, py, pixelColour);
+				}
+			}
+			
+			// 完成整個tile後，一次性更新film - 顯著減少鎖爭用
+			{
+				std::lock_guard<std::mutex> lock(filmMutex);
+				for (unsigned int y = tile->startY; y < tile->endY; y++) {
+					for (unsigned int x = tile->startX; x < tile->endX; x++) {
+						unsigned int localX = x - tile->startX;
+						unsigned int localY = y - tile->startY;
+						
+						if (localX >= width || localY >= height)
+							continue;
+							
+						unsigned int index = localY * width + localX;
+						
+						if (index < tileColourBuffer.size()) {
+							film->splat(x + 0.5f, y + 0.5f, tileColourBuffer[index]);
+						}
 					}
 				}
 			}
@@ -1078,10 +1263,8 @@ public:
 			// 增加已完成的樣本數量
 			tile->samplesCompleted += 1;
 			
-			// 每處理完一個tile後適當休眠，避免佔用過多CPU
-			if (tilesProcessed % 10 == 0) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			}
+			// 移除不必要的休眠，避免性能損失
+			// 如果需要避免CPU完全占用，可以使用更高效的方式
 		}
 		
 		// 退出前減少活動線程計數
@@ -1099,8 +1282,12 @@ public:
 		// 清空film中的数据
 		clear();
 		
-		// 使用多线程渲染
-		renderMultithreaded();
+		// 根据设置选择渲染方式
+		if (multithreaded) {
+			renderOptimizedMultithreaded(); // 使用优化后的多线程渲染
+		} else {
+			renderSingleThreaded(); // 使用单线程渲染
+		}
 	}
 	
 	void saveHDR(std::string filename)
@@ -1153,34 +1340,51 @@ public:
 			oidn::DeviceRef device = oidn::newDevice();
 			device.commit();
 			
-			// 创建降噪过滤器（选择"RT"模式，适用于路径追踪）
-			oidn::FilterRef filter = device.newFilter("RT");
+			// 计算图像大小和数据大小
+			size_t pixelCount = film->width * film->height;
+			size_t dataSize = pixelCount * sizeof(Colour); // Colour是3个float
 			
 			// 准备输入数据 - 确保用正确的SPP值归一化
-			Colour* normalizedColor = new Colour[film->width * film->height];
-			for (unsigned int i = 0; i < film->width * film->height; i++) {
-				normalizedColor[i] = film->film[i] / (float)film->SPP;
+			Colour* normalizedColor = new Colour[pixelCount];
+			for (unsigned int i = 0; i < pixelCount; i++) {
+				// 在输入前预先调整亮度 - 稍微降低亮度，改善去噪后过亮问题
+				normalizedColor[i] = film->film[i] / ((float)film->SPP * 1.2f);
 			}
 			
 			// 确保denoisedBuffer已初始化
 			if (!film->denoisedBuffer) {
-				film->denoisedBuffer = new Colour[film->width * film->height];
+				film->denoisedBuffer = new Colour[pixelCount];
 			}
 			
-			// 设置输入输出缓冲区
-			filter.setImage("color", (float*)normalizedColor, oidn::Format::Float3, film->width, film->height);
-			filter.setImage("albedo", (float*)film->albedoBuffer, oidn::Format::Float3, film->width, film->height);
-			filter.setImage("normal", (float*)film->normalBuffer, oidn::Format::Float3, film->width, film->height);
-			filter.setImage("output", (float*)film->denoisedBuffer, oidn::Format::Float3, film->width, film->height);
+			// 创建OIDN设备缓冲区
+			oidn::BufferRef colorBuffer = device.newBuffer(dataSize);
+			oidn::BufferRef albedoBuffer = device.newBuffer(dataSize);
+			oidn::BufferRef normalBuffer = device.newBuffer(dataSize);
+			oidn::BufferRef outputBuffer = device.newBuffer(dataSize);
 			
-			// 启用HDR模式
+			// 复制数据到设备缓冲区
+			memcpy(colorBuffer.getData(), normalizedColor, dataSize);
+			memcpy(albedoBuffer.getData(), film->albedoBuffer, dataSize);
+			memcpy(normalBuffer.getData(), film->normalBuffer, dataSize);
+			
+			// 创建降噪过滤器（选择"RT"模式，适用于路径追踪）
+			oidn::FilterRef filter = device.newFilter("RT");
+			
+			// 设置输入输出缓冲区 - 使用设备缓冲区而不是直接内存指针
+			filter.setImage("color", colorBuffer, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("albedo", albedoBuffer, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("normal", normalBuffer, oidn::Format::Float3, film->width, film->height);
+			filter.setImage("output", outputBuffer, oidn::Format::Float3, film->width, film->height);
+			
+			// 启用HDR模式但添加参数优化
 			filter.set("hdr", true);
+			filter.set("cleanAux", true); // 提前清理辅助缓冲区
 			
 			// 提交配置并执行降噪
 			filter.commit();
 			filter.execute();
 			
-			// 检查错误 - 修复错误处理方式
+			// 检查错误
 			const char* errorMessage = nullptr;
 			if (device.getError(errorMessage) != oidn::Error::None && errorMessage != nullptr) {
 				std::cerr << "OIDN denoising error: " << errorMessage << std::endl;
@@ -1188,10 +1392,19 @@ public:
 				return;
 			}
 			
+			// 将结果从设备缓冲区复制回主机内存
+			memcpy(film->denoisedBuffer, outputBuffer.getData(), dataSize);
+			
+			// 添加亮度调整以解决去噪后过亮问题
+			float exposureScale = 0.4f; // 降低亮度
+			for (unsigned int i = 0; i < pixelCount; i++) {
+				film->denoisedBuffer[i] = film->denoisedBuffer[i] * exposureScale;
+			}
+			
 			// 调试信息：检查输出是否有效
 			float maxValue = 0.0f;
 			float minValue = 1.0f;
-			for (unsigned int i = 0; i < film->width * film->height; i++) {
+			for (unsigned int i = 0; i < pixelCount; i++) {
 				// 使用三目运算符替代std::max和std::min
 				maxValue = (film->denoisedBuffer[i].r > maxValue) ? film->denoisedBuffer[i].r : maxValue;
 				maxValue = (film->denoisedBuffer[i].g > maxValue) ? film->denoisedBuffer[i].g : maxValue;
@@ -1229,7 +1442,7 @@ public:
 		// 预分配VPL容量以提高性能
 		vpls.reserve(numVPLs);
 		
-		std::cout << "生成 " << numVPLs << " 个VPL..." << std::endl;
+		std::cout << "Generating " << numVPLs << " VPLs..." << std::endl;
 		
 		MTRandom sampler(42); // 使用固定种子以获得确定性结果
 		
@@ -1289,7 +1502,7 @@ public:
 			VPLTracePath(ray, Colour(1.0f, 1.0f, 1.0f), Le, &sampler, 0);
 		}
 		
-		std::cout << "成功生成 " << vpls.size() << " 个VPL" << std::endl;
+		std::cout << "Successfully generated " << vpls.size() << " VPLs" << std::endl;
 	}
 	
 	// 递归追踪VPL路径并存储VPL - 使用参数传递递归深度
@@ -1378,6 +1591,11 @@ public:
 		}
 	}
 	
+	// 设置VPL强度截断阈值
+	void setVPLClampThreshold(float threshold) {
+		vplClampThreshold = threshold;
+	}
+	
 	// 设置控制参数的方法
 	void setEnableMIS(bool enable) {
 		enableMIS = enable;
@@ -1414,4 +1632,708 @@ public:
 			}
 		}
 	}
+	
+	// 添加光子映射相关方法
+	void setEnablePhotonMapping(bool enable) {
+		enablePhotonMapping = enable;
+		// 如果启用了光子映射，初始化光子映射器
+		if (enable && !photonMapper && scene) {
+			photonMapper = new PhotonMapper(scene, numGlobalPhotons, numCausticPhotons, photonRadius);
+		}
+	}
+	
+	bool isEnablePhotonMapping() const {
+		return enablePhotonMapping;
+	}
+	
+	void setEnableCausticPhotons(bool enable) {
+		enableCausticPhotons = enable;
+	}
+	
+	bool isEnableCausticPhotons() const {
+		return enableCausticPhotons;
+	}
+	
+	void setEnableFinalGathering(bool enable) {
+		enableFinalGathering = enable;
+	}
+	
+	bool isEnableFinalGathering() const {
+		return enableFinalGathering;
+	}
+	
+	void setPhotonCounts(int global, int caustic) {
+		numGlobalPhotons = global;
+		numCausticPhotons = caustic;
+		if (photonMapper) {
+			photonMapper->setPhotonCounts(global, caustic);
+		}
+	}
+	
+	void setPhotonRadius(float radius) {
+		photonRadius = radius;
+		if (photonMapper) {
+			photonMapper->setGatherRadius(radius);
+		}
+	}
+	
+	void setFinalGatheringSamples(int samples) {
+		finalGatheringSamples = samples;
+	}
+	
+	// 添加使用光子映射的路径追踪方法
+	Colour photonMappingPathTrace(Ray& r, Sampler* sampler, int depth = 0) {
+		if (depth >= maxPathDepth) return Colour(0, 0, 0);
+		
+		// 与场景求交
+		IntersectionData isect = scene->traverse(r);
+		
+		// 如果没有交点，返回背景光照
+		if (isect.t == FLT_MAX) {
+			if (scene->background) {
+				return scene->background->evaluate(ShadingData(), -r.dir);
+			}
+			return Colour(0, 0, 0);
+		}
+		
+		// 计算着色点数据
+		ShadingData shadingData = scene->calculateShadingData(isect, r);
+		
+		// 获取材质
+		BSDF* material = scene->materials[scene->triangles[isect.ID].materialIndex];
+		shadingData.bsdf = material;
+		
+		// 如果是光源，直接返回发射值
+		if (material->isLight()) {
+			return material->emit(shadingData, shadingData.wo);
+		}
+		
+		// 计算直接光照
+		Colour directLight = computeDirect(shadingData, sampler);
+		
+		// 计算间接光照（使用光子映射）
+		Colour indirectLight(0, 0, 0);
+		
+		// 如果材质是漫反射，使用光子映射估计间接光照
+		if (material->isDiffuse()) {
+			// 确保获取颜色而非灰度信息
+			indirectLight = photonMapper->estimateIndirectLight(shadingData, true, true);
+			
+			// 如果启用了最终聚集，使用最终聚集改善质量
+			if (enableFinalGathering) {
+				indirectLight = photonMapper->finalGathering(shadingData, finalGatheringSamples);
+			}
+		} else {
+			// 对于镜面材质，使用递归追踪
+			float pdf;
+			Colour brdf;
+			Vec3 bounceDir = material->sample(shadingData, sampler, brdf, pdf);
+			
+			if (pdf > 0 && (brdf.r > 0.0f || brdf.g > 0.0f || brdf.b > 0.0f)) {
+				// 计算反弹方向的贡献
+				Ray bounceRay(shadingData.x + shadingData.sNormal * RAY_EPSILON, bounceDir);
+				Colour bounceRadiance = photonMappingPathTrace(bounceRay, sampler, depth + 1);
+				
+				// 计算间接光照贡献 - 确保保留颜色信息
+				float cosTheta = Dot(bounceDir, shadingData.sNormal) > 0.0f ? Dot(bounceDir, shadingData.sNormal) : 0.0f;
+				indirectLight.r = brdf.r * bounceRadiance.r * cosTheta / pdf;
+				indirectLight.g = brdf.g * bounceRadiance.g * cosTheta / pdf;
+				indirectLight.b = brdf.b * bounceRadiance.b * cosTheta / pdf;
+			}
+		}
+		
+		// 返回直接光照和间接光照的和
+		return directLight + indirectLight;
+	}
+	
+	// 添加仅使用焦散光子的渲染模式
+	Colour causticPhotonMapping(Ray& r, Sampler* sampler) {
+		// 与场景求交
+		IntersectionData isect = scene->traverse(r);
+		
+		// 如果没有交点，返回背景光照
+		if (isect.t == FLT_MAX) {
+			if (scene->background) {
+				return scene->background->evaluate(ShadingData(), -r.dir);
+			}
+			return Colour(0, 0, 0);
+		}
+		
+		// 计算着色点数据
+		ShadingData shadingData = scene->calculateShadingData(isect, r);
+		
+		// 获取材质
+		BSDF* material = scene->materials[scene->triangles[isect.ID].materialIndex];
+		shadingData.bsdf = material;
+		
+		// 如果是光源，直接返回发射值
+		if (material->isLight()) {
+			return material->emit(shadingData, shadingData.wo);
+		}
+		
+		// 计算直接光照
+		Colour directLight = computeDirect(shadingData, sampler);
+		
+		// 计算焦散光照（使用光子映射）
+		Colour causticLight(0, 0, 0);
+		
+		// 只对漫反射表面使用焦散光子映射
+		if (material->isDiffuse()) {
+			// 只使用焦散光子 - 确保获取颜色而非灰度信息
+			causticLight = photonMapper->estimateIndirectLight(shadingData, true, false);
+		}
+		
+		// 返回直接光照和焦散光照的和
+		return directLight + causticLight;
+	}
+	
+	Colour trace(Ray& r, int threadID)
+	{
+		Sampler* sampler = &samplers[threadID];
+		
+		// 根据渲染模式选择不同的渲染算法
+		switch (renderMode)
+		{
+		case 0: // 法线可视化
+			return viewNormals(r);
+		case 1: // 反照率
+			return albedo(r);
+		case 2: // 可视化VPLs
+			if (enableIR) {
+				return visualizeVPLs(r, sampler);
+			}
+			return Colour(0.0f, 0.0f, 0.0f);
+		case 3: // Path Tracing
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		case 4: // 直接照明
+			return directOnly(r, sampler);
+		case 5: // 使用IR的全局照明
+			if (enableIR) {
+				return irIndirect(r, sampler);
+			}
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		case 6: // 光子映射
+			if (enablePhotonMapping && photonMapper) {
+				return photonMappingPathTrace(r, sampler);
+			}
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		case 7: // 仅焦散光子映射
+			if (enablePhotonMapping && photonMapper) {
+				return causticPhotonMapping(r, sampler);
+			}
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		case 8: // 带最终聚集的光子映射
+			if (enablePhotonMapping && photonMapper) {
+				enableFinalGathering = true;
+				return photonMappingPathTrace(r, sampler);
+			}
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		default:
+			{
+				Colour pathThroughput(1.0f, 1.0f, 1.0f);
+				return pathTrace(r, pathThroughput, 0, sampler);
+			}
+		}
+	}
+	
+	// 添加直接光照渲染函数
+	Colour directOnly(Ray& r, Sampler* sampler)
+	{
+		// 与场景相交
+		IntersectionData hit = scene->traverse(r);
+		if (hit.t == FLT_MAX) {
+			if (scene->background != nullptr) {
+				return scene->background->evaluate(ShadingData(), r.dir);
+			}
+			return Colour(0.0f, 0.0f, 0.0f);
+		}
+		
+		// 计算交点的着色数据
+		ShadingData shadingData = scene->calculateShadingData(hit, r);
+		
+		// 如果是光源，直接返回发射值
+		if (shadingData.bsdf->isLight())
+		{
+			return shadingData.bsdf->emit(shadingData, -r.dir);
+		}
+		
+		// 计算直接光照并返回
+		return computeDirect(shadingData, sampler);
+	}
+	
+	// 添加类成员变量vplClampThreshold, vplMutex
+	std::mutex vplMutex;       // 保护VPL集合的互斥锁
+	float vplClampThreshold = 0.1f; // VPL强度截断阈值，用于避免奇异性
+	float RR_PROB = 0.8f;      // 俄罗斯轮盘赌概率
+	
+	Colour estimatePhotonIndirect(const ShadingData& shadingData) {
+		if (!photonMapper) return Colour(0.0f, 0.0f, 0.0f);
+		
+		// 根据渲染模式和启用状态决定使用哪种光子图
+		if (renderMode == 7) {
+			// 焦散光子映射模式 - 主要关注焦散
+			return photonMapper->estimateIndirectLight(shadingData, enableCausticPhotons, false);
+		} else {
+			// 标准光子映射模式或最终聚集模式
+			return photonMapper->estimateIndirectLight(shadingData, enableCausticPhotons, true);
+		}
+	}
+	
+	// 新增：逐像素单线程渲染函数 - 不使用tile，直接按像素处理
+	void renderSingleThreaded()
+	{
+		std::cout << "[INFO] Starting single-threaded rendering..." << std::endl;
+		std::cout << "[INFO] Configuration: " << SPP << " samples, " 
+				  << "Image: " << film->width << "x" << film->height << std::endl;
+		
+		// 清空之前的渲染结果
+		film->clear();
+		canvas->clear();
+		canvas->present();
+		
+		// 显示基本场景信息
+		std::cout << "[INFO] Scene: " << scene->triangles.size() << " triangles, "
+				  << scene->lights.size() << " lights" << std::endl;
+		std::cout << "[INFO] The image will gradually improve as samples complete..." << std::endl;
+		
+		// 使用单个线程的采样器
+		MTRandom& sampler = samplers[0];
+		
+		// 记录总渲染时间
+		auto totalStartTime = std::chrono::high_resolution_clock::now();
+		
+		// 分阶段渲染，每个阶段添加一个样本
+		for (int currentSpp = 0; currentSpp < SPP; currentSpp++) {
+			// 开始当前样本
+			auto sampleStartTime = std::chrono::high_resolution_clock::now();
+			
+			// 进度变量
+			int lastProgress = -1;
+			int totalPixels = film->width * film->height;
+			int processedPixels = 0;
+			
+			// 对每个像素渲染一个样本
+			for (unsigned int y = 0; y < film->height; y++) {
+				for (unsigned int x = 0; x < film->width; x++) {
+					// 生成射线
+					float px = x + sampler.next();
+					float py = y + sampler.next();
+					Ray ray = scene->camera.generateRay(px, py);
+					
+					// 根据渲染模式跟踪射线
+					Colour pixelColour = trace(ray, 0);
+					
+					// 处理NaN值
+					if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
+						pixelColour = Colour(0.0f, 0.0f, 0.0f);
+					}
+					
+					// 限制极端值
+					const float maxValue = 10.0f;
+					if (pixelColour.r > maxValue) pixelColour.r = maxValue;
+					if (pixelColour.g > maxValue) pixelColour.g = maxValue;
+					if (pixelColour.b > maxValue) pixelColour.b = maxValue;
+					
+					// 更新film和屏幕
+					film->splat(px, py, pixelColour);
+					
+					// 如果启用了AOV收集
+					if (collectAOVs && currentSpp == 0) {
+						// 获取反照率
+						Colour albedoColour = albedo(ray);
+						// 获取法线
+						Colour normalColour = viewNormals(ray);
+						// 更新AOV
+						film->setAlbedo(px, py, albedoColour);
+						film->setNormal(px, py, normalColour);
+					}
+					
+					// 立即更新画面 - 实时显示每个像素的变化
+					if (x % 8 == 0 && y % 8 == 0) { // 每8个像素更新一次屏幕，减少开销
+						unsigned char r, g, b;
+						film->tonemap(x, y, r, g, b);
+						canvas->draw(x, y, r, g, b);
+					}
+					
+					// 更新进度
+					processedPixels++;
+					int progress = (processedPixels * 100) / totalPixels;
+					
+					// 每处理1%的像素更新一次进度条
+					if (progress != lastProgress && progress % 1 == 0) {
+						auto currentTime = std::chrono::high_resolution_clock::now();
+						auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - sampleStartTime).count() / 1000.0f;
+						
+						std::cout << "\r" << "Sample " << (currentSpp + 1) << "/" << SPP << " [";
+						int barWidth = 30;
+						int pos = barWidth * progress / 100;
+						for (int i = 0; i < barWidth; ++i) {
+							if (i < pos) std::cout << "=";
+							else if (i == pos) std::cout << ">";
+							else std::cout << " ";
+						}
+						std::cout << "] " << progress << "% (" << std::fixed << std::setprecision(1) << elapsed << "s)";
+						std::cout.flush();
+						
+						lastProgress = progress;
+						canvas->present(); // 更新屏幕
+					}
+				}
+			}
+			
+			// 更新样本计数
+			film->SPP = currentSpp + 1;
+			
+			// 最终更新显示
+			for (unsigned int y = 0; y < film->height; y++) {
+				for (unsigned int x = 0; x < film->width; x++) {
+					unsigned char r, g, b;
+					film->tonemap(x, y, r, g, b);
+					canvas->draw(x, y, r, g, b);
+				}
+			}
+			canvas->present();
+			
+			// 计算并显示样本完成时间
+			auto sampleEndTime = std::chrono::high_resolution_clock::now();
+			auto sampleDuration = std::chrono::duration_cast<std::chrono::milliseconds>(sampleEndTime - sampleStartTime).count() / 1000.0f;
+			std::cout << "\r" << "Sample " << (currentSpp + 1) << "/" << SPP << " [";
+			for (int i = 0; i < 30; ++i) std::cout << "=";
+			std::cout << "] 100% (" << std::fixed << std::setprecision(1) << sampleDuration << "s)" << std::endl;
+		}
+		
+		// 计算总时间
+		auto totalEndTime = std::chrono::high_resolution_clock::now();
+		auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEndTime - totalStartTime).count() / 1000.0f;
+		
+		std::cout << std::endl;
+		std::cout << "[INFO] Render complete in " << std::fixed << std::setprecision(2) << totalDuration << " seconds!" << std::endl;
+		std::cout << "[INFO] Average: " << std::fixed << std::setprecision(2) << (totalDuration / SPP) << " seconds per sample" << std::endl;
+	}
+	
+	// 优化的tile处理函数 - 处理多个样本，减少同步开销
+	void processOptimizedTile(unsigned int tileStartX, unsigned int tileStartY, unsigned int tileEndX, unsigned int tileEndY, int sampleOffset, int sampleCount, int threadId) {
+		// 访问线程专用采样器
+		MTRandom& sampler = samplers[threadId];
+		
+		// 计算tile尺寸
+		unsigned int tileWidth = tileEndX - tileStartX;
+		unsigned int tileHeight = tileEndY - tileStartY;
+		
+		// 创建批次结果缓冲区
+		std::vector<Colour> batchResults(tileWidth * tileHeight, Colour(0.0f, 0.0f, 0.0f));
+		
+		// 处理这个tile的多个样本
+		for (int sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++) {
+			// 处理tile中的每个像素
+			for (unsigned int y = tileStartY; y < tileEndY; y++) {
+				for (unsigned int x = tileStartX; x < tileEndX; x++) {
+					// 计算此像素在局部缓冲区中的索引
+					unsigned int bufferIdx = (y - tileStartY) * tileWidth + (x - tileStartX);
+					
+					// 生成光线
+					float px = x + sampler.next();
+					float py = y + sampler.next();
+					Ray ray = scene->camera.generateRay(px, py);
+					
+					// 跟踪光线
+					Colour pixelColour = trace(ray, threadId);
+					
+					// 处理NaN值
+					if (std::isnan(pixelColour.r) || std::isnan(pixelColour.g) || std::isnan(pixelColour.b)) {
+						pixelColour = Colour(0.0f, 0.0f, 0.0f);
+					}
+					
+					// 限制极端值
+					const float maxValue = 10.0f;
+					if (pixelColour.r > maxValue) pixelColour.r = maxValue;
+					if (pixelColour.g > maxValue) pixelColour.g = maxValue;
+					if (pixelColour.b > maxValue) pixelColour.b = maxValue;
+					
+					// 累积到批次结果中
+					batchResults[bufferIdx] = batchResults[bufferIdx] + pixelColour;
+					
+					// 收集AOVs（仅针对第一个样本）
+					if (collectAOVs && sampleIdx == 0 && sampleOffset == 0) {
+						Colour albedoColour = albedo(ray);
+						Colour normalColour = viewNormals(ray);
+						
+						// 使用锁保护AOV更新
+						std::lock_guard<std::mutex> lock(filmMutex);
+						film->setAlbedo(px, py, albedoColour);
+						film->setNormal(px, py, normalColour);
+					}
+				}
+			}
+		}
+		
+		// 批量更新film，减少锁争用
+		{
+			std::lock_guard<std::mutex> lock(filmMutex);
+			for (unsigned int y = tileStartY; y < tileEndY; y++) {
+				for (unsigned int x = tileStartX; x < tileEndX; x++) {
+					unsigned int bufferIdx = (y - tileStartY) * tileWidth + (x - tileStartX);
+					float px = x + 0.5f;
+					float py = y + 0.5f;
+					film->splat(px, py, batchResults[bufferIdx]);
+				}
+			}
+		}
+	}
+	
+	// 新的优化版多线程渲染函数
+	void renderOptimizedMultithreaded() {
+		std::cout << "[INFO] Starting optimized multithreaded rendering..." << std::endl;
+		std::cout << "[INFO] Configuration: " << SPP << " samples, " 
+				  << "Batch size: " << batchSize << ", "
+				  << "Tile size: " << tileSize << "x" << tileSize << ", "
+				  << "Image: " << film->width << "x" << film->height << std::endl;
+		
+		// 清空之前的渲染结果
+		film->clear();
+		canvas->clear();
+		canvas->present();
+		
+		// 计算tile数量
+		unsigned int numTilesX = (film->width + tileSize - 1) / tileSize;
+		unsigned int numTilesY = (film->height + tileSize - 1) / tileSize;
+		unsigned int totalTiles = numTilesX * numTilesY;
+		
+		// 显示场景信息
+		std::cout << "[INFO] Scene: " << scene->triangles.size() << " triangles, "
+				  << scene->lights.size() << " lights, "
+				  << totalTiles << " tiles" << std::endl;
+		std::cout << "[INFO] The image will gradually improve as samples complete..." << std::endl;
+		
+		// 记录总渲染时间
+		auto totalStartTime = std::chrono::high_resolution_clock::now();
+		
+		// 计算需要多少批次来完成所有样本
+		int totalBatches = (SPP + batchSize - 1) / batchSize;
+		
+		// 批次渲染循环
+		for (int batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+			// 计算这批次需要渲染的样本数
+			int samplesInBatch = (batchIdx == totalBatches - 1) ? 
+								 (SPP - batchIdx * batchSize) : batchSize;
+			
+			// 开始当前批次计时
+			auto batchStartTime = std::chrono::high_resolution_clock::now();
+			
+			// 进度跟踪
+			std::atomic<int> completedTiles(0);
+			
+			// 提交所有tile任务到线程池
+			for (unsigned int tileY = 0; tileY < numTilesY; tileY++) {
+				for (unsigned int tileX = 0; tileX < numTilesX; tileX++) {
+					// 计算tile边界
+					unsigned int startX = tileX * tileSize;
+					unsigned int startY = tileY * tileSize;
+					unsigned int endX = minimum(startX + tileSize, film->width);
+					unsigned int endY = minimum(startY + tileSize, film->height);
+					
+					// 分配线程ID - 循环分配
+					int threadId = (tileY * numTilesX + tileX) % numProcs;
+					
+					// 提交任务到线程池
+					threadPool->enqueue([this, startX, startY, endX, endY, batchIdx, samplesInBatch, threadId, &completedTiles]() {
+						// 处理tile
+						processOptimizedTile(startX, startY, endX, endY, batchIdx * batchSize, samplesInBatch, threadId);
+						
+						// 增加完成的tile计数
+						completedTiles++;
+					});
+				}
+			}
+			
+			// 监控进度
+			auto lastUpdateTime = std::chrono::high_resolution_clock::now();
+			int lastProgress = -1;
+			
+			// 等待所有tile完成
+			while (completedTiles < totalTiles) {
+				// 计算进度
+				int progress = (completedTiles * 100) / totalTiles;
+				
+				// 当前时间
+				auto currentTime = std::chrono::high_resolution_clock::now();
+				auto timeSinceLastUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastUpdateTime).count();
+				
+				// 定期更新显示 (每500毫秒)
+				bool shouldUpdateDisplay = timeSinceLastUpdate > 500;
+				
+				// 如果进度变化或需要更新显示
+				if (progress != lastProgress || shouldUpdateDisplay) {
+					// 显示进度条
+					std::cout << "\r" << "Batch " << (batchIdx + 1) << "/" << totalBatches
+							  << " (" << (batchIdx * batchSize + 1) << "-" << minimum((batchIdx + 1) * batchSize, SPP) 
+							  << "/" << SPP << " samples) [";
+					
+					int barWidth = 30;
+					int pos = barWidth * progress / 100;
+					for (int i = 0; i < barWidth; ++i) {
+						if (i < pos) std::cout << "=";
+						else if (i == pos) std::cout << ">";
+						else std::cout << " ";
+					}
+					
+					// 计算耗时
+					auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - batchStartTime).count() / 1000.0f;
+					
+					std::cout << "] " << progress << "% (" << std::fixed << std::setprecision(1) << elapsed << "s)";
+					std::cout.flush();
+					
+					lastProgress = progress;
+					
+					// 更新显示
+					if (shouldUpdateDisplay) {
+						updateFullDisplay();
+						lastUpdateTime = currentTime;
+					}
+				}
+				
+				// 减轻CPU负担
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+			
+			// 批次完成，更新film的样本计数
+			film->SPP += samplesInBatch;
+			
+			// 更新显示
+			updateFullDisplay();
+			
+			// 取消间隔去噪，只在最终渲染完成后去噪
+			/*
+			bool shouldDenoise = enableDenoising && film->hasAOVs && 
+								 (film->SPP >= SPP || (film->SPP % denoiseInterval) == 0);
+			
+			if (shouldDenoise) {
+				std::cout << "\r" << "Performing denoising at " << film->SPP << " samples..." << std::flush;
+				denoise();
+				
+				// 显示降噪后的图像
+				for (unsigned int y = 0; y < film->height; y++) {
+					for (unsigned int x = 0; x < film->width; x++) {
+						unsigned char r, g, b;
+						// 从降噪缓冲区中获取颜色
+						Colour c = film->denoisedBuffer[y * film->width + x];
+						
+						// 应用色调映射和伽马校正
+						c.r = c.r < 0.0f ? 0.0f : (c.r > 1.0f ? 1.0f : c.r);
+						c.g = c.g < 0.0f ? 0.0f : (c.g > 1.0f ? 1.0f : c.g);
+						c.b = c.b < 0.0f ? 0.0f : (c.b > 1.0f ? 1.0f : c.b);
+						
+						r = (unsigned char)(pow(c.r, 1.0f / 2.2f) * 255.0f);
+						g = (unsigned char)(pow(c.g, 1.0f / 2.2f) * 255.0f);
+						b = (unsigned char)(pow(c.b, 1.0f / 2.2f) * 255.0f);
+						
+						canvas->draw(x, y, r, g, b);
+					}
+				}
+				canvas->present();
+				std::cout << " done!" << std::endl;
+			}
+			*/
+			
+			// 计算并显示批次完成时间
+			auto batchEndTime = std::chrono::high_resolution_clock::now();
+			auto batchDuration = std::chrono::duration_cast<std::chrono::milliseconds>(batchEndTime - batchStartTime).count() / 1000.0f;
+			
+			std::cout << "\r" << "Batch " << (batchIdx + 1) << "/" << totalBatches 
+					  << " (" << (batchIdx * batchSize + 1) << "-" << minimum((batchIdx + 1) * batchSize, SPP) 
+					  << "/" << SPP << " samples) [";
+			
+			for (int i = 0; i < 30; ++i) std::cout << "=";
+			std::cout << "] 100% (" << std::fixed << std::setprecision(1) << batchDuration << "s)" << std::endl;
+		}
+		
+		// 计算总时间
+		auto totalEndTime = std::chrono::high_resolution_clock::now();
+		auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEndTime - totalStartTime).count() / 1000.0f;
+		
+		// 渲染结束后，执行最终降噪
+		if (enableDenoising && film->hasAOVs) {
+			std::cout << "Performing final denoising..." << std::flush;
+			denoise();
+			
+			// 显示最终降噪结果
+			for (unsigned int y = 0; y < film->height; y++) {
+				for (unsigned int x = 0; x < film->width; x++) {
+					unsigned char r, g, b;
+					Colour c = film->denoisedBuffer[y * film->width + x];
+					
+					c.r = c.r < 0.0f ? 0.0f : (c.r > 1.0f ? 1.0f : c.r);
+					c.g = c.g < 0.0f ? 0.0f : (c.g > 1.0f ? 1.0f : c.g);
+					c.b = c.b < 0.0f ? 0.0f : (c.b > 1.0f ? 1.0f : c.b);
+					
+					r = (unsigned char)(pow(c.r, 1.0f / 2.2f) * 255.0f);
+					g = (unsigned char)(pow(c.g, 1.0f / 2.2f) * 255.0f);
+					b = (unsigned char)(pow(c.b, 1.0f / 2.2f) * 255.0f);
+					
+					canvas->draw(x, y, r, g, b);
+				}
+			}
+			canvas->present();
+			std::cout << " done!" << std::endl;
+		}
+		
+		std::cout << std::endl;
+		std::cout << "[INFO] Render complete in " << std::fixed << std::setprecision(2) << totalDuration << " seconds!" << std::endl;
+		std::cout << "[INFO] Average: " << std::fixed << std::setprecision(2) << (totalDuration / totalBatches) << " seconds per batch" << std::endl;
+		std::cout << "[INFO] Samples per second: " << std::fixed << std::setprecision(2) 
+				  << (film->width * film->height * SPP) / totalDuration << std::endl;
+	}
+	
+	~RayTracer() {
+		// 释放线程池
+		if (threadPool) {
+			delete threadPool;
+			threadPool = nullptr;
+		}
+		
+		// ... 现有析构代码 ...
+	}
+
+    // 环境光参数控制方法
+    void setEnvImportanceSamplingStrength(float strength) {
+        if (scene && scene->background) {
+            EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+            if (envMap) {
+                envMap->setImportanceSamplingStrength(strength);
+            }
+        }
+    }
+
+    void setEnvMinSamplingWeight(float weight) {
+        if (scene && scene->background) {
+            EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+            if (envMap) {
+                envMap->setMinSamplingWeight(weight);
+            }
+        }
+    }
+
+    void setEnvUseCosineWeighting(bool use) {
+        if (scene && scene->background) {
+            EnvironmentMap* envMap = dynamic_cast<EnvironmentMap*>(scene->background);
+            if (envMap) {
+                envMap->setUseCosineWeighting(use);
+            }
+        }
+    }
 };

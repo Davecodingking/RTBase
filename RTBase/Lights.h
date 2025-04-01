@@ -4,16 +4,16 @@
 #include "Geometry.h"
 #include "Sampling.h"
 #include <vector>
-#include <algorithm> // 用于std::lower_bound
+#include <algorithm> // For std::lower_bound
 
 #pragma warning( disable : 4244)
 
-// 前向聲明
+// Forward declaration
 class BSDF;
 class ShadingData;
 
-// 確保能使用use<SceneBounds>()
-// SceneBounds在Core.h中定義
+// Ensure use<SceneBounds>() can be used
+// SceneBounds is defined in Core.h
 
 class Light
 {
@@ -132,49 +132,69 @@ class EnvironmentMap : public Light
 {
 public:
 	Texture* env;
-	// 添加重要性采样所需的数据结构
-	std::vector<float> marginalCDF; // y方向(行)的累积分布函数
-	std::vector<std::vector<float>> conditionalCDF; // 每行x方向的条件累积分布函数
-	std::vector<float> rowWeights; // 每行的权重总和
-	bool enableImportanceSampling; // 控制是否使用重要性采样
+	// Add data structures needed for importance sampling
+	std::vector<float> marginalCDF; // Cumulative distribution function in y direction (rows)
+	std::vector<std::vector<float>> conditionalCDF; // Conditional CDF in x direction for each row
+	std::vector<float> rowWeights; // Total weight of each row
+	bool enableImportanceSampling; // Control whether to use importance sampling
+	float brightnessScale; // Environment light brightness scale factor to control overall brightness
+	float importanceSamplingStrength; // Importance sampling strength, controls sampling bias towards bright areas
+	float minSamplingWeight; // Minimum sampling weight, prevents dark areas from being completely ignored
+	bool useCosineWeighting; // Whether to use cosine weighted sampling
 
 	EnvironmentMap(Texture* _env)
 	{
 		env = _env;
-		enableImportanceSampling = true; // 默认启用重要性采样
-		// 预计算基于亮度的CDF用于重要性采样
+		enableImportanceSampling = true; // Default enable importance sampling
+		brightnessScale = 1.0f; // Default brightness scale 1.0, no reduction in environment light intensity
+		importanceSamplingStrength = 1.0f; // Default importance sampling strength
+		minSamplingWeight = 0.1f; // Default minimum sampling weight
+		useCosineWeighting = true; // Default use cosine weighting
+		// Precompute luminance-based CDF for importance sampling
 		buildDistributions();
 	}
 	
-	// 构建用于重要性采样的分布
+	// Build distributions for importance sampling
 	void buildDistributions() 
 	{
 		if (env == nullptr || env->width <= 0 || env->height <= 0) return;
 		
-		// 调整数据结构大小
+		// Adjust data structure size
 		conditionalCDF.resize(env->height);
 		marginalCDF.resize(env->height + 1);
 		rowWeights.resize(env->height);
 		
-		// 计算每行的PDF和CDF
+		// Calculate PDF and CDF for each row
 		for (int v = 0; v < env->height; ++v) {
-			// 该行的像素的权重与sin(theta)成正比
+			// Weight of pixels in this row is proportional to sin(theta)
 			float sinTheta = sinf(((float)v + 0.5f) / (float)env->height * M_PI);
 			
-			// 为当前行分配空间
+			// Allocate space for current row
 			conditionalCDF[v].resize(env->width + 1);
 			conditionalCDF[v][0] = 0;
 			
-			// 累积该行的亮度值
+			// Accumulate luminance values for this row
 			float rowWeight = 0;
 			for (int u = 0; u < env->width; ++u) {
 				Colour pixel = env->texels[v * env->width + u];
-				float weight = pixel.Lum() * sinTheta;
+				float weight = pixel.Lum();
+				
+				// Apply importance sampling strength
+				weight = std::pow(weight, importanceSamplingStrength);
+				
+				// Apply minimum sampling weight
+				weight = std::max(weight, minSamplingWeight);
+				
+				// Apply cosine weighting
+				if (useCosineWeighting) {
+					weight *= sinTheta;
+				}
+				
 				rowWeight += weight;
 				conditionalCDF[v][u + 1] = conditionalCDF[v][u] + weight;
 			}
 			
-			// 归一化这一行的CDF
+			// Normalize CDF for this row
 			if (rowWeight > 0) {
 				for (int u = 1; u <= env->width; ++u) {
 					conditionalCDF[v][u] /= rowWeight;
@@ -185,7 +205,7 @@ public:
 			marginalCDF[v + 1] = marginalCDF[v] + rowWeight;
 		}
 		
-		// 归一化纵向的CDF
+		// Normalize vertical CDF
 		if (marginalCDF[env->height] > 0) {
 			for (int v = 1; v <= env->height; ++v) {
 				marginalCDF[v] /= marginalCDF[env->height];
@@ -193,14 +213,14 @@ public:
 		}
 	}
 	
-	// 根据均匀随机变量找到CDF中的索引
+	// Find index in CDF based on uniform random variable
 	int sampleDiscrete(const std::vector<float>& cdf, float u, float& pdf) {
-		// 在cdf中找到第一个大于u的位置
+		// Find first position in cdf greater than u
 		auto it = std::lower_bound(cdf.begin(), cdf.end(), u);
 		int index = (int)std::distance(cdf.begin(), it) - 1;
 		index = (index < 0) ? 0 : ((index > (int)cdf.size() - 2) ? (int)cdf.size() - 2 : index);
 		
-		// 计算选择该索引的概率
+		// Calculate probability of selecting this index
 		pdf = (cdf[index + 1] - cdf[index]);
 		return index;
 	}
@@ -209,27 +229,27 @@ public:
 	{
 		// Assignment: Update this code to importance sampling lighting based on luminance of each pixel
 		if (env == nullptr || env->width <= 0 || env->height <= 0 || !enableImportanceSampling || marginalCDF.empty()) {
-			// 回退到均匀采样
+			// Fallback to uniform sampling
 			Vec3 wi = SamplingDistributions::uniformSampleSphere(sampler->next(), sampler->next());
 			pdf = SamplingDistributions::uniformSpherePDF(wi);
 			reflectedColour = evaluate(shadingData, wi);
 			return wi;
 		}
 		
-		// 重要性采样
+		// Importance sampling
 		float pdfV, pdfU;
 		
-		// 采样v坐标(行)
+		// Sample v coordinate (row)
 		int v = sampleDiscrete(marginalCDF, sampler->next(), pdfV);
 		
-		// 采样u坐标(列)
+		// Sample u coordinate (column)
 		int u = sampleDiscrete(conditionalCDF[v], sampler->next(), pdfU);
 		
-		// 计算球坐标
+		// Calculate spherical coordinates
 		float phi = (u + sampler->next()) / (float)env->width * 2.0f * M_PI;
 		float theta = (v + sampler->next()) / (float)env->height * M_PI;
 		
-		// 转换为笛卡尔坐标
+		// Convert to Cartesian coordinates
 		float sinTheta = sinf(theta);
 		float cosTheta = cosf(theta);
 		float sinPhi = sinf(phi);
@@ -237,11 +257,11 @@ public:
 		
 		Vec3 wi(sinTheta * cosPhi, cosTheta, sinTheta * sinPhi);
 		
-		// 计算pdf (注意球面面积元素的jacobian)
+		// Calculate pdf (note spherical area element jacobian)
 		float envPdf = pdfV * pdfU / (2.0f * M_PI * M_PI * sinTheta);
 		pdf = envPdf > 0 ? envPdf : SamplingDistributions::uniformSpherePDF(wi);
 		
-		// 获取环境贴图的颜色
+		// Get environment map color, apply brightness scale
 		reflectedColour = evaluate(shadingData, wi);
 		
 		return wi;
@@ -252,7 +272,8 @@ public:
 		u = (u < 0.0f) ? u + (2.0f * M_PI) : u;
 		u = u / (2.0f * M_PI);
 		float v = acosf(wi.y) / M_PI;
-		return env->sample(u, v);
+		// Apply brightness scale factor, but do not automatically adjust brightness
+		return env->sample(u, v) * brightnessScale;
 	}
 	float PDF(const ShadingData& shadingData, const Vec3& wi)
 	{
@@ -261,30 +282,30 @@ public:
 			return SamplingDistributions::uniformSpherePDF(wi);
 		}
 		
-		// 计算纹理坐标
+		// Calculate texture coordinates
 		float phi = atan2f(wi.z, wi.x);
 		if (phi < 0) phi += 2.0f * M_PI;
 		float y_clamped = (wi.y < -1.0f) ? -1.0f : ((wi.y > 1.0f) ? 1.0f : wi.y);
 		float theta = acosf(y_clamped);
 		
-		// 映射到像素坐标，并确保在有效范围内
+		// Map to pixel coordinates and ensure within valid range
 		int ui = std::min((int)(phi / (2.0f * M_PI) * env->width), env->width - 1);
 		int vi = std::min((int)(theta / M_PI * env->height), env->height - 1);
 		
 		float sinTheta = sinf(theta);
-		// 如果sin(theta)接近0，对应球体的极点，返回均匀PDF
+		// If sin(theta) is close to 0, corresponding to the poles of the sphere, return uniform PDF
 		if (sinTheta < 1e-5f) return SamplingDistributions::uniformSpherePDF(wi);
 		
-		// 从累积分布函数计算该点的PDF
+		// Calculate PDF from cumulative distribution function
 		float rowPdf = (marginalCDF[vi + 1] - marginalCDF[vi]) * env->height;
 		float colPdf = 0.0f;
 		if (vi < conditionalCDF.size() && ui < env->width) {
 			colPdf = (conditionalCDF[vi][ui + 1] - conditionalCDF[vi][ui]) * env->width;
 		}
 		
-		// 计算最终PDF，包括球面面积元素的jacobian
+		// Calculate final PDF, including spherical area element jacobian
 		float pdf = (rowPdf * colPdf) / (2.0f * M_PI * M_PI * sinTheta);
-		return (pdf < 0.0f) ? 0.0f : pdf;  // 确保PDF为非负
+		return (pdf < 0.0f) ? 0.0f : pdf;  // Ensure PDF is non-negative
 	}
 	bool isArea()
 	{
@@ -306,7 +327,8 @@ public:
 			}
 		}
 		total = total / (float)(env->width * env->height);
-		return total * 4.0f * M_PI;
+		// Apply brightness scale, but do not automatically adjust brightness
+		return total * 4.0f * M_PI * brightnessScale;
 	}
 	Vec3 samplePositionFromLight(Sampler* sampler, float& pdf)
 	{
@@ -321,26 +343,26 @@ public:
 	{
 		// Replace this tabulated sampling of environment maps
 		if (env == nullptr || env->width <= 0 || env->height <= 0 || !enableImportanceSampling || marginalCDF.empty()) {
-			// 回退到均匀采样
+			// Fallback to uniform sampling
 			Vec3 wi = SamplingDistributions::uniformSampleSphere(sampler->next(), sampler->next());
 			pdf = SamplingDistributions::uniformSpherePDF(wi);
 			return wi;
 		}
 		
-		// 使用与sample方法相同的重要性采样技术
+		// Use same importance sampling technique as sample method
 		float pdfV, pdfU;
 		
-		// 采样v坐标(行)
+		// Sample v coordinate (row)
 		int v = sampleDiscrete(marginalCDF, sampler->next(), pdfV);
 		
-		// 采样u坐标(列)
+		// Sample u coordinate (column)
 		int u = sampleDiscrete(conditionalCDF[v], sampler->next(), pdfU);
 		
-		// 计算球坐标
+		// Calculate spherical coordinates
 		float phi = (u + sampler->next()) / (float)env->width * 2.0f * M_PI;
 		float theta = (v + sampler->next()) / (float)env->height * M_PI;
 		
-		// 转换为笛卡尔坐标
+		// Convert to Cartesian coordinates
 		float sinTheta = sinf(theta);
 		float cosTheta = cosf(theta);
 		float sinPhi = sinf(phi);
@@ -348,10 +370,28 @@ public:
 		
 		Vec3 wi(sinTheta * cosPhi, cosTheta, sinTheta * sinPhi);
 		
-		// 计算pdf (注意球面面积元素的jacobian)
+		// Calculate pdf (note spherical area element jacobian)
 		float envPdf = pdfV * pdfU / (2.0f * M_PI * M_PI * sinTheta);
 		pdf = envPdf > 0 ? envPdf : SamplingDistributions::uniformSpherePDF(wi);
 		
 		return wi;
+	}
+
+	// Set importance sampling strength
+	void setImportanceSamplingStrength(float strength) {
+		importanceSamplingStrength = strength;
+		buildDistributions(); // Rebuild distributions
+	}
+
+	// Set minimum sampling weight
+	void setMinSamplingWeight(float weight) {
+		minSamplingWeight = weight;
+		buildDistributions(); // Rebuild distributions
+	}
+
+	// Set whether to use cosine weighting
+	void setUseCosineWeighting(bool use) {
+		useCosineWeighting = use;
+		buildDistributions(); // Rebuild distributions
 	}
 };

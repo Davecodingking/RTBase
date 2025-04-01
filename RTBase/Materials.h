@@ -188,8 +188,14 @@ public:
 	}
 	Colour evaluate(const ShadingData& shadingData, const Vec3& wi)
 	{
-		// Add correct evaluation code here
-		return albedo->sample(shadingData.tu, shadingData.tv) / M_PI;
+		// 將世界坐標轉換為局部坐標
+		Vec3 localWi = shadingData.frame.toLocal(wi);
+		
+		// 計算余弦項（確保非負）
+		float cosTheta = std::max(0.0f, localWi.z);
+		
+		// 正確的Lambertian BRDF需要乘以余弦項
+		return albedo->sample(shadingData.tu, shadingData.tv) * cosTheta / M_PI;
 	}
 	float PDF(const ShadingData& shadingData, const Vec3& wi)
 	{

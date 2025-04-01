@@ -19,9 +19,24 @@ public:
 	{
 		generator.seed(seed);
 	}
+	
+	// 添加初始化方法
+	void init(unsigned int seed)
+	{
+		generator.seed(seed);
+	}
+	
 	float next()
 	{
 		return dist(generator);
+	}
+	
+	// 添加静态随机函数，用于光子映射
+	static float randomFloat()
+	{
+		static std::mt19937 staticGen(42);
+		static std::uniform_real_distribution<float> staticDist(0.0f, 1.0f);
+		return staticDist(staticGen);
 	}
 };
 
