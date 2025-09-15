@@ -1,8 +1,8 @@
 #pragma once
 
 // 以下两种包含方式，编译器会选择能找到的那一个
-// 实际编译时不会有问题，只是IDE可能会显示错误
-//#include "../oidn-2.3.2.x64.windows/include/OpenImageDenoise/oidn.hpp"
+
+//#include "../oidn-2.3.3.x64.windows/include/OpenImageDenoise/oidn.hpp"
 #include <OpenImageDenoise/oidn.hpp>
 
 #include "Core.h"
